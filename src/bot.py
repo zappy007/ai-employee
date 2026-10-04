@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -15,6 +16,9 @@ load_dotenv()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+# FIX: httpx/httpcore log full request URLs at INFO level, which leaks the Telegram bot token
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Load credentials
@@ -43,14 +47,18 @@ if os.path.exists(SOUL_PATH):
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # Cloud-based Mem0 configuration (Zero heavy PyTorch RAM usage)
+EMBEDDING_DIMS = 768
+
 mem0_config = {
     "vector_store": {
         "provider": "qdrant",
         "config": {
             "url": QDRANT_URL,
             "api_key": QDRANT_API_KEY,
-            "collection_name": "ai_employee_memory_v2",
-            "embedding_model_dims": 768,
+            # FIX: new collection, since the new embedding model's vectors
+            # are not compatible with the old embedding-001 vectors
+            "collection_name": "ai_employee_memory_v3",
+            "embedding_model_dims": EMBEDDING_DIMS,
         },
     },
     "llm": {
@@ -63,16 +71,20 @@ mem0_config = {
     "embedder": {
         "provider": "gemini",
         "config": {
-            "model": "embedding-001",
+            # FIX: embedding-001 returns 404; use gemini-embedding-001
+            "model": "models/gemini-embedding-001",
+            "embedding_dims": EMBEDDING_DIMS,
             "api_key": GEMINI_API_KEY,
         },
     },
 }
 memory = Memory.from_config(mem0_config)
 
+
 def is_authorized(update: Update) -> bool:
     user_id = str(update.effective_user.id).strip()
     return user_id == ALLOWED_USER_ID
+
 
 def parse_memories(raw_output) -> list:
     items = []
@@ -88,6 +100,7 @@ def parse_memories(raw_output) -> list:
                 items.append(entry["memory"])
     return items
 
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         await update.message.reply_text("Access restricted.")
@@ -95,6 +108,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "AI Personal Employee operational on Render Cloud. How can I assist you today?"
     )
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -166,11 +180,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def save_memory_task():
         if len(user_text.split()) < 3:
             return
-        import time
         for attempt in range(3):
             try:
                 memory.add(user_text, user_id=user_id)
-                print("[Memory Engine] Logged to Qdrant Cloud successfully.")
+                logger.info("[Memory Engine] Logged to Qdrant Cloud successfully.")
                 break
             except Exception as e:
                 if "503" in str(e) and attempt < 2:
@@ -179,7 +192,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"[Memory Engine] Extraction notice: {e}")
                     break
 
-    asyncio.get_event_loop().run_in_executor(None, save_memory_task)
+    # FIX: get_running_loop() instead of the deprecated get_event_loop()
+    asyncio.get_running_loop().run_in_executor(None, save_memory_task)
+
 
 # Lightweight HTTP Health Check Server using standard library
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -192,9 +207,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+
 def run_health_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
     server.serve_forever()
+
 
 def main():
     if not TELEGRAM_BOT_TOKEN or not ALLOWED_USER_ID:
@@ -213,6 +230,7 @@ def main():
 
     print("Bot is live! Listening for Telegram messages...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
