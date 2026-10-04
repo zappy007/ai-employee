@@ -1,0 +1,8 @@
+# Secret credentials (NEVER commit to Git)
+.env
+
+# Virtual environment & caches
+venv/
+__pycache__/
+*.pyc
+.cache/
