@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+from aiohttp import web
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
@@ -15,13 +16,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Load credentials from .env
+# Load credentials from .env / Render Environment
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_USER_ID = str(os.getenv("TELEGRAM_ALLOWED_USER_ID", "")).strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+PORT = int(os.getenv("PORT", 10000))
 
 CHAT_MODEL = "qwen/qwen3.8-27b"
 EXTRACTION_MODEL = "gemini-3.8-flash"
@@ -39,15 +41,15 @@ if os.path.exists(SOUL_PATH):
 # Initialize Groq client
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Initialize Mem0 Memory System
+# Initialize Mem0 Memory System with Cloud Embeddings (Zero Local RAM overhead)
 mem0_config = {
     "vector_store": {
         "provider": "qdrant",
         "config": {
             "url": QDRANT_URL,
             "api_key": QDRANT_API_KEY,
-            "collection_name": "ai_employee_memory",
-            "embedding_model_dims": 384,
+            "collection_name": "ai_employee_memory_v2",
+            "embedding_model_dims": 768,
         },
     },
     "llm": {
@@ -58,9 +60,10 @@ mem0_config = {
         },
     },
     "embedder": {
-        "provider": "huggingface",
+        "provider": "gemini",
         "config": {
-            "model": "all-MiniLM-L6-v2",
+            "model": "models/text-embedding-004",
+            "api_key": GEMINI_API_KEY,
         },
     },
 }
@@ -71,7 +74,6 @@ def is_authorized(update: Update) -> bool:
     return user_id == ALLOWED_USER_ID
 
 def parse_memories(raw_output) -> list:
-    """Safely normalizes both list and dict outputs from Mem0 across library versions."""
     items = []
     if isinstance(raw_output, list):
         for entry in raw_output:
@@ -90,7 +92,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Access restricted.")
         return
     await update.message.reply_text(
-        "AI Personal Employee online and reporting for duty. Memory persistent on Qdrant Cloud. How can I assist you today?"
+        "AI Personal Employee online and operational on Render Cloud. How can I assist you today?"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -101,45 +103,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     user_id = str(update.effective_user.id).strip()
 
-    # Send typing indicator
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     # 1. TWO-TIER MEMORY RETRIEVAL
     all_facts = []
 
-    # Tier 1: Pull full persistent user profile (Always injected)
+    # Tier 1: Pull full persistent profile
     try:
         profile_res = memory.get_all(filters={"user_id": user_id})
         all_facts.extend(parse_memories(profile_res))
     except Exception as e:
-        logger.warning(f"Core profile retrieval note: {e}")
+        logger.warning(f"Profile retrieval: {e}")
 
-    # Tier 2: Pull episodic/topic-specific memories matching this message
+    # Tier 2: Pull episodic semantic memories
     try:
         search_res = memory.search(user_text, filters={"user_id": user_id})
         all_facts.extend(parse_memories(search_res))
     except Exception as e:
-        logger.warning(f"Episodic memory search note: {e}")
+        logger.warning(f"Episodic search: {e}")
 
-    # Deduplicate facts while preserving order
     unique_memories = list(dict.fromkeys(all_facts))
 
     retrieved_context = ""
     if unique_memories:
         retrieved_context = "\n- " + "\n- ".join(unique_memories)
-        print(f"\n[Active Context Loaded ({len(unique_memories)} facts)]:{retrieved_context}\n")
 
-    # 2. CONSTRUCT SYSTEM PROMPT WITH MEMORY & ROLES
+    # 2. AUGMENT SYSTEM PROMPT
     augmented_system = SYSTEM_PROMPT
     if retrieved_context:
         augmented_system += (
             f"\n\n### KNOWN FACTS & LONG-TERM MEMORY ABOUT THE USER:\n"
             f"{retrieved_context}\n\n"
-            f"Directive: Use the facts above as ground-truth knowledge about your employer. "
-            f"Never claim you do not know who they are or that you have no memory if facts are listed above."
+            f"Directive: Use the facts above as ground-truth context about your employer."
         )
 
-    # 3. SLIDING CONVERSATION WINDOW (Last 8 turns)
+    # 3. SLIDING CONVERSATION WINDOW
     if user_id not in chat_history:
         chat_history[user_id] = []
 
@@ -157,38 +155,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         reply_text = f"Processing error: {e}"
 
-    # Update conversation history
     chat_history[user_id].append({"role": "user", "content": user_text})
     chat_history[user_id].append({"role": "assistant", "content": reply_text})
 
-    # 5. DELIVER RESPONSE
+    # 5. SEND REPLY
     await update.message.reply_text(reply_text)
 
-    # 6. ASYNCHRONOUS BACKGROUND EXTRACTION
+    # 6. ASYNC EXTRACTION WITH AUTO-RETRY
     def save_memory_task():
         if len(user_text.split()) < 3:
             return
-        try:
-            print(f"[Memory Engine] Analyzing input for extraction: '{user_text}'")
-            memory.add(user_text, user_id=user_id)
-            print("[Memory Engine] Saved to Qdrant Cloud successfully.")
-        except Exception as e:
-            logger.error(f"[Memory Engine] Extraction error: {e}")
+        import time
+        for attempt in range(3):
+            try:
+                memory.add(user_text, user_id=user_id)
+                print("[Memory Engine] Logged to Qdrant Cloud successfully.")
+                break
+            except Exception as e:
+                if "503" in str(e) and attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+                else:
+                    logger.error(f"[Memory Engine] Extraction notice: {e}")
+                    break
 
     asyncio.get_event_loop().run_in_executor(None, save_memory_task)
 
-def main():
-    if not TELEGRAM_BOT_TOKEN or not ALLOWED_USER_ID:
-        raise ValueError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_ALLOWED_USER_ID in .env")
+# Dummy health check server for Render Port Binding
+async def health_check(request):
+    return web.Response(text="Bot is running!")
 
-    print(f"Starting AI Employee Telegram Bot for User ID: {ALLOWED_USER_ID}...")
+async def start_web_server():
+    server = web.Application()
+    server.router.add_get("/", health_check)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"Health server bound to port {PORT}")
+
+async def run_bot():
+    if not TELEGRAM_BOT_TOKEN or not ALLOWED_USER_ID:
+        raise ValueError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_ALLOWED_USER_ID")
+
+    print(f"Starting AI Employee for User ID: {ALLOWED_USER_ID}...")
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
+    # Start the dummy web server to keep Render healthy
+    await start_web_server()
+
+    # Start Telegram polling
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
     print("Bot is live! Listening for Telegram messages...")
-    app.run_polling()
+
+    # Keep the event loop running
+    while True:
+        await asyncio.sleep(3600)
+
+def main():
+    asyncio.run(run_bot())
 
 if __name__ == "__main__":
     main()
