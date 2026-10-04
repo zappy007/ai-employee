@@ -62,12 +62,13 @@ mem0_config = {
         },
     },
     "llm": {
-        "provider": "gemini",
-        "config": {
-            "model": EXTRACTION_MODEL,
-            "api_key": GEMINI_API_KEY,
-        },
+    "provider": "groq",
+    "config": {
+        "model": "llama-3.3-70b-versatile",
+        "api_key": GROQ_API_KEY,
+        "temperature": 0.1,
     },
+},
     "embedder": {
         "provider": "gemini",
         "config": {
