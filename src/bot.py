@@ -16,7 +16,7 @@ load_dotenv()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-# FIX: httpx/httpcore log full request URLs at INFO level, which leaks the Telegram bot token
+# Suppress noisy HTTP logs that leak access tokens
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -31,7 +31,6 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 PORT = int(os.getenv("PORT", 10000))
 
 CHAT_MODEL = "qwen/qwen3.8-27b"
-EXTRACTION_MODEL = "gemini-3.8-flash"
 
 # In-memory sliding window for turn-by-turn dialogue
 chat_history = {}
@@ -46,7 +45,7 @@ if os.path.exists(SOUL_PATH):
 # Initialize Groq client
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Cloud-based Mem0 configuration (Zero heavy PyTorch RAM usage)
+# Cloud-based Mem0 configuration
 EMBEDDING_DIMS = 768
 
 mem0_config = {
@@ -55,30 +54,27 @@ mem0_config = {
         "config": {
             "url": QDRANT_URL,
             "api_key": QDRANT_API_KEY,
-            # FIX: new collection, since the new embedding model's vectors
-            # are not compatible with the old embedding-001 vectors
             "collection_name": "ai_employee_memory_v3",
             "embedding_model_dims": EMBEDDING_DIMS,
         },
     },
     "llm": {
-    "provider": "groq",
-    "config": {
-        "model": "llama-3.3-70b-versatile",
-        "api_key": GROQ_API_KEY,
-        "temperature": 0.1,
+        "provider": "groq",
+        "config": {
+            "model": "qwen/qwen3.8-27b",
+            "api_key": GROQ_API_KEY,
+        },
     },
-},
     "embedder": {
         "provider": "gemini",
         "config": {
-            # FIX: embedding-001 returns 404; use gemini-embedding-001
-            "model": "models/gemini-embedding-001",
+            "model": "models/text-embedding-004",
             "embedding_dims": EMBEDDING_DIMS,
             "api_key": GEMINI_API_KEY,
         },
     },
 }
+
 memory = Memory.from_config(mem0_config)
 
 
@@ -193,7 +189,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"[Memory Engine] Extraction notice: {e}")
                     break
 
-    # FIX: get_running_loop() instead of the deprecated get_event_loop()
     asyncio.get_running_loop().run_in_executor(None, save_memory_task)
 
 
@@ -218,7 +213,7 @@ def main():
     if not TELEGRAM_BOT_TOKEN or not ALLOWED_USER_ID:
         raise ValueError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_ALLOWED_USER_ID")
 
-    # Start the HTTP server on a daemon thread to bind the port for Render
+    # Start HTTP server daemon for Render uptime port binding
     http_thread = threading.Thread(target=run_health_server, daemon=True)
     http_thread.start()
     print(f"Health server successfully bound to port {PORT}")
