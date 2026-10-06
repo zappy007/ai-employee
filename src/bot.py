@@ -12,11 +12,14 @@ from mem0 import Memory
 
 load_dotenv()
 
+# Fix 1: Disable Mem0 PostHog telemetry to eliminate duplicate client warnings
+os.environ["MEM0_TELEMETRY"] = "False"
+
 # Configure logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-# Suppress noisy HTTP logs that leak access tokens
+# Suppress noisy HTTP logs that leak tokens
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -79,6 +82,8 @@ memory = Memory.from_config(mem0_config)
 
 
 def is_authorized(update: Update) -> bool:
+    if not update or not update.effective_user:
+        return False
     user_id = str(update.effective_user.id).strip()
     return user_id == ALLOWED_USER_ID
 
@@ -192,6 +197,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.get_running_loop().run_in_executor(None, save_memory_task)
 
 
+# Fix 2: Global Telegram Error Handler to safely catch and log unhandled exceptions
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
+
 # Lightweight HTTP Health Check Server using standard library
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -213,7 +223,6 @@ def main():
     if not TELEGRAM_BOT_TOKEN or not ALLOWED_USER_ID:
         raise ValueError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_ALLOWED_USER_ID")
 
-    # Start HTTP server daemon for Render uptime port binding
     http_thread = threading.Thread(target=run_health_server, daemon=True)
     http_thread.start()
     print(f"Health server successfully bound to port {PORT}")
@@ -221,8 +230,12 @@ def main():
     print(f"Starting AI Employee for User ID: {ALLOWED_USER_ID}...")
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Register command and message handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+
+    # Register error handler
+    app.add_error_handler(error_handler)
 
     print("Bot is live! Listening for Telegram messages...")
     app.run_polling()
