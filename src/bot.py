@@ -1,4 +1,8 @@
 import os
+
+# CHANGE 2: set telemetry flag BEFORE importing mem0 (mem0 reads it at import time)
+os.environ["MEM0_TELEMETRY"] = "False"
+
 import time
 import asyncio
 import logging
@@ -11,9 +15,6 @@ from groq import Groq
 from mem0 import Memory
 
 load_dotenv()
-
-# Fix 1: Disable Mem0 PostHog telemetry to eliminate duplicate client warnings
-os.environ["MEM0_TELEMETRY"] = "False"
 
 # Configure logging
 logging.basicConfig(
@@ -71,7 +72,8 @@ mem0_config = {
     "embedder": {
         "provider": "gemini",
         "config": {
-            "model": "models/text-embedding-004",
+            # CHANGE 1 (the actual fix): text-embedding-004 returns 404 -> use gemini-embedding-001
+            "model": "models/gemini-embedding-001",
             "embedding_dims": EMBEDDING_DIMS,
             "api_key": GEMINI_API_KEY,
         },
@@ -197,7 +199,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.get_running_loop().run_in_executor(None, save_memory_task)
 
 
-# Fix 2: Global Telegram Error Handler to safely catch and log unhandled exceptions
+# Global Telegram Error Handler to safely catch and log unhandled exceptions
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
 
@@ -243,3 +245,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
