@@ -693,18 +693,245 @@ async def deliver_report(bot, chat_id, user_id: str, kind: str):
     await send_long(bot, chat_id, text)
 
 
+# ----- Editable schedule (change it by chatting; saved in Qdrant so it survives restarts) -----
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+WEEKDAY_LOOKUP = {
+    "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1, "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3, "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5, "sunday": 6, "sun": 6,
+}
+SETTINGS_COLLECTION = "ai_employee_settings"
+SETTINGS_POINT_ID = 1
+
+
+def default_schedule() -> dict:
+    return {
+        "daily": {"enabled": True, "hour": BRIEFING_HOUR, "minute": BRIEFING_MINUTE},
+        "weekly": {"enabled": True, "weekday": WEEKLY_REPORT_WEEKDAY,
+                   "hour": WEEKLY_REPORT_HOUR, "minute": WEEKLY_REPORT_MINUTE},
+    }
+
+
+schedule = default_schedule()
+last_run = {}          # kind -> date string of the last delivery
+_qdrant_client = None
+
+
+def get_qdrant():
+    global _qdrant_client
+    if _qdrant_client is None:
+        from qdrant_client import QdrantClient
+        _qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    return _qdrant_client
+
+
+def load_schedule():
+    """Load the saved schedule from Qdrant (falls back to the defaults if unavailable)."""
+    try:
+        from qdrant_client.models import VectorParams, Distance
+        client = get_qdrant()
+        names = [c.name for c in client.get_collections().collections]
+        if SETTINGS_COLLECTION not in names:
+            client.create_collection(
+                collection_name=SETTINGS_COLLECTION,
+                vectors_config=VectorParams(size=1, distance=Distance.DOT),
+            )
+        points = client.retrieve(collection_name=SETTINGS_COLLECTION, ids=[SETTINGS_POINT_ID], with_payload=True)
+        if points and points[0].payload and isinstance(points[0].payload.get("schedule"), dict):
+            saved = points[0].payload["schedule"]
+            for kind in ("daily", "weekly"):
+                if isinstance(saved.get(kind), dict):
+                    for key, value in saved[kind].items():
+                        if key in schedule[kind]:
+                            schedule[kind][key] = value
+            logger.info("[Scheduler] Loaded saved schedule from Qdrant.")
+    except Exception as e:
+        logger.warning(f"[Scheduler] Could not load saved schedule, using defaults: {e}")
+
+
+def save_schedule():
+    try:
+        from qdrant_client.models import PointStruct
+        get_qdrant().upsert(
+            collection_name=SETTINGS_COLLECTION,
+            points=[PointStruct(id=SETTINGS_POINT_ID, vector=[0.0], payload={"schedule": schedule})],
+        )
+        return True
+    except Exception as e:
+        logger.error(f"[Scheduler] Could not save schedule: {e}")
+        return False
+
+
+def tz_label() -> str:
+    return "IST" if TIMEZONE_NAME == "Asia/Kolkata" else TIMEZONE_NAME
+
+
+def fmt_time(hour: int, minute: int) -> str:
+    suffix = "AM" if hour < 12 else "PM"
+    return f"{(hour % 12) or 12}:{minute:02d} {suffix}"
+
+
+def format_schedule() -> str:
+    d, w = schedule["daily"], schedule["weekly"]
+    daily = f"every day at {fmt_time(d['hour'], d['minute'])} {tz_label()}" if d["enabled"] else "turned off"
+    weekly = (f"every {WEEKDAY_NAMES[w['weekday']]} at {fmt_time(w['hour'], w['minute'])} {tz_label()}"
+              if w["enabled"] else "turned off")
+    return (
+        f"Morning briefing: {daily}\n"
+        f"Weekly report: {weekly}\n\n"
+        "To change them just tell me, for example: \"move my briefing to 8:30 AM\", "
+        "\"send the weekly report on Monday at 5 PM\", or \"turn off the briefing\"."
+    )
+
+
+OFF_WORDS = ("turn off", "switch off", "disable", "stop sending", "stop the", "stop my", "pause",
+             "cancel", "no more", "don't send", "dont send", "do not send")
+ON_WORDS = ("turn on", "switch on", "enable", "resume", "restart", "start sending")
+CHANGE_WORDS = ("change", "set ", "move", "shift", "update", "reschedule", "switch", "make it", "make the", "make my")
+SEND_WORDS = ("send", "schedule", "deliver", "remind")
+SHOW_WORDS = ("what time", "when do", "when is", "when will", "show schedule", "my schedule", "show my schedule")
+
+
+def parse_time_of_day(t: str, kind: str):
+    """Return (hour, minute, assumed) from text, None if no time, or 'invalid'."""
+    if "noon" in t:
+        return 12, 0, False
+    if "midnight" in t:
+        return 0, 0, False
+
+    m = re.search(r"(\d{1,2}):(\d{2})\s*(a\.?m\.?|p\.?m\.?)?", t)
+    if m:
+        hour, minute, meridiem = int(m.group(1)), int(m.group(2)), m.group(3)
+    else:
+        m = re.search(r"\b(\d{1,2})\s*(a\.?m\.?|p\.?m\.?)(?![a-z])", t)
+        if m:
+            hour, minute, meridiem = int(m.group(1)), 0, m.group(2)
+        else:
+            m = re.search(r"\b(?:at|to|by|for)\s+(\d{1,2})\b(?!\s*(?:tasks|items|days|min|things))", t)
+            if not m:
+                return None
+            hour, minute, meridiem = int(m.group(1)), 0, None
+
+    if minute > 59:
+        return "invalid"
+    assumed = False
+    if meridiem:
+        if not 1 <= hour <= 12:
+            return "invalid"
+        hour = hour % 12 + (12 if meridiem.replace(".", "").startswith("p") else 0)
+    elif 1 <= hour <= 12:
+        assumed = True   # no AM/PM given: morning for the briefing, evening for the weekly report
+        if kind == "weekly" and hour < 12:
+            hour += 12
+    elif hour > 23:
+        return "invalid"
+    return hour, minute, assumed
+
+
+def parse_schedule_request(text: str):
+    """Understand 'move my briefing to 8:30 AM' style messages. Returns a dict, or None for normal chat."""
+    t = " " + text.lower().strip() + " "
+
+    kinds = set()
+    if "weekly" in t or ("week" in t and "report" in t):
+        kinds.add("weekly")
+    if "briefing" in t or "daily report" in t or "daily summary" in t:
+        kinds.add("daily")
+    if not kinds and "report" in t:
+        kinds.add("weekly")
+    if not kinds:
+        return None
+    if len(kinds) == 2:
+        if any(w in t for w in OFF_WORDS + ON_WORDS + CHANGE_WORDS + SEND_WORDS):
+            return {"action": "ambiguous"}
+        return None
+    kind = kinds.pop()
+
+    time_result = parse_time_of_day(t, kind)
+    weekday_match = re.search(r"\b(" + "|".join(sorted(WEEKDAY_LOOKUP, key=len, reverse=True)) + r")\b", t)
+    weekday = WEEKDAY_LOOKUP[weekday_match.group(1)] if (weekday_match and kind == "weekly") else None
+    has_change_word = any(w in t for w in CHANGE_WORDS)
+    has_send_word = any(w in t for w in SEND_WORDS)
+
+    if any(w in t for w in OFF_WORDS):
+        return {"action": "off", "kind": kind}
+
+    if time_result == "invalid":
+        return {"action": "invalid", "kind": kind}
+
+    if (time_result is not None and (has_change_word or has_send_word or " at " in t or " to " in t)) or \
+            (weekday is not None and has_change_word):
+        change = {"action": "set", "kind": kind}
+        if time_result is not None:
+            change["hour"], change["minute"], change["assumed"] = time_result
+        if weekday is not None:
+            change["weekday"] = weekday
+        return change
+
+    if any(w in t for w in ON_WORDS):
+        return {"action": "on", "kind": kind}
+
+    if any(w in t for w in SHOW_WORDS):
+        return {"action": "show", "kind": kind}
+    return None
+
+
+async def apply_schedule_change(change: dict) -> str:
+    action = change["action"]
+    if action == "ambiguous":
+        return ("I can change one schedule at a time. For example: \"move my briefing to 8:30 AM\" "
+                "and then \"send the weekly report on Friday at 6 PM\".")
+    if action == "show":
+        return format_schedule()
+    if action == "invalid":
+        return "I couldn't understand that time. Try something like \"8:30 AM\" or \"18:00\"."
+
+    kind = change["kind"]
+    name = "morning briefing" if kind == "daily" else "weekly report"
+    entry = schedule[kind]
+
+    if action == "off":
+        entry["enabled"] = False
+    elif action == "on":
+        entry["enabled"] = True
+    else:
+        entry["enabled"] = True
+        if "hour" in change:
+            entry["hour"], entry["minute"] = change["hour"], change["minute"]
+        if "weekday" in change:
+            entry["weekday"] = change["weekday"]
+    last_run.pop(kind, None)   # lets the new time fire today if it is still ahead
+
+    saved = await asyncio.to_thread(save_schedule)
+
+    if not entry["enabled"]:
+        reply = f"Okay, your {name} is turned off. Say \"turn on my {name}\" any time to bring it back."
+    elif kind == "daily":
+        reply = f"Done. Your morning briefing will arrive every day at {fmt_time(entry['hour'], entry['minute'])} {tz_label()}."
+    else:
+        reply = (f"Done. Your weekly report will arrive every {WEEKDAY_NAMES[entry['weekday']]} "
+                 f"at {fmt_time(entry['hour'], entry['minute'])} {tz_label()}.")
+    if change.get("assumed"):
+        reply += (" I assumed AM." if kind == "daily" else " I assumed PM.") + " Say the AM/PM explicitly if I got it wrong."
+    if not saved:
+        reply += "\n(Warning: I couldn't save this to the database, so it may reset if the bot restarts.)"
+    return reply
+
+
 def due_jobs(now: datetime, last_run: dict) -> list:
     """Which scheduled reports should fire right now. Pure function so it is easy to test."""
     due = []
     today = now.date().isoformat()
     minutes_now = now.hour * 60 + now.minute
 
-    daily_at = BRIEFING_HOUR * 60 + BRIEFING_MINUTE
-    if daily_at <= minutes_now < daily_at + SCHEDULE_WINDOW_MINUTES and last_run.get("daily") != today:
+    d = schedule["daily"]
+    daily_at = d["hour"] * 60 + d["minute"]
+    if d["enabled"] and daily_at <= minutes_now < daily_at + SCHEDULE_WINDOW_MINUTES and last_run.get("daily") != today:
         due.append("daily")
 
-    weekly_at = WEEKLY_REPORT_HOUR * 60 + WEEKLY_REPORT_MINUTE
-    if (now.weekday() == WEEKLY_REPORT_WEEKDAY
+    w = schedule["weekly"]
+    weekly_at = w["hour"] * 60 + w["minute"]
+    if (w["enabled"] and now.weekday() == w["weekday"]
             and weekly_at <= minutes_now < weekly_at + SCHEDULE_WINDOW_MINUTES
             and last_run.get("weekly") != today):
         due.append("weekly")
@@ -712,12 +939,7 @@ def due_jobs(now: datetime, last_run: dict) -> list:
 
 
 async def scheduler_loop(app):
-    last_run = {}
-    logger.info(
-        f"[Scheduler] Started. Daily briefing {BRIEFING_HOUR:02d}:{BRIEFING_MINUTE:02d}, "
-        f"weekly report weekday={WEEKLY_REPORT_WEEKDAY} at {WEEKLY_REPORT_HOUR:02d}:{WEEKLY_REPORT_MINUTE:02d} "
-        f"({TIMEZONE_NAME})."
-    )
+    logger.info(f"[Scheduler] Started.\n{format_schedule().splitlines()[0]}\n{format_schedule().splitlines()[1]}")
     while True:
         try:
             now = now_local()
@@ -737,6 +959,7 @@ async def scheduler_loop(app):
 
 async def post_init(app):
     if ENABLE_SCHEDULER:
+        await asyncio.to_thread(load_schedule)
         app.bot_data["scheduler_task"] = asyncio.create_task(scheduler_loop(app))
 
 
@@ -744,6 +967,13 @@ async def post_shutdown(app):
     task = app.bot_data.get("scheduler_task")
     if task:
         task.cancel()
+
+
+async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("Access restricted.")
+        return
+    await update.message.reply_text(format_schedule())
 
 
 async def briefing_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -822,7 +1052,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "AI Personal Employee operational on Render Cloud. How can I assist you today?\n"
         "Send a short voice note and I'll answer it like a message. Send a longer voice note or call recording "
         "and I'll transcribe it, summarise it, and save the action items.\n"
-        "Commands: /briefing, /weekly, /memories, /forget <number>."
+        "Commands: /briefing, /weekly, /schedule, /memories, /forget <number>.\n"
+        "You can also say things like \"move my briefing to 8:30 AM\"."
     )
 
 
@@ -884,6 +1115,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
     """Core assistant + memory pipeline, shared by typed messages and short voice notes."""
     user_id = str(update.effective_user.id).strip()
+
+    # "Move my briefing to 8:30 AM" etc. is handled here, not sent to the AI or saved as a memory
+    change = parse_schedule_request(user_text)
+    if change is not None:
+        await update.message.reply_text(await apply_schedule_change(change))
+        return
 
     # 1. TWO-TIER RETRIEVAL (run off the event loop so the bot stays responsive)
     all_facts = []
@@ -1029,6 +1266,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("schedule", schedule_command))
     app.add_handler(CommandHandler("briefing", briefing_command))
     app.add_handler(CommandHandler("weekly", weekly_command))
     app.add_handler(CommandHandler("memories", memories_command))
