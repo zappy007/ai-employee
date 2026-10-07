@@ -9,7 +9,7 @@ import json
 import time
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, date, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 from dotenv import load_dotenv
@@ -54,6 +54,15 @@ TIMEZONE_NAME = os.getenv("TIMEZONE", "Asia/Kolkata")
 # Voice notes up to this many seconds are treated as a spoken message to the assistant (answered like text).
 # Longer ones are treated as call recordings (summary + action items). Set to 0 to always treat audio as recordings.
 VOICE_COMMAND_MAX_SECONDS = int(os.getenv("VOICE_COMMAND_MAX_SECONDS", 60))
+
+# --- Scheduled reports (times are in TIMEZONE, default India time) ---------
+ENABLE_SCHEDULER = os.getenv("ENABLE_SCHEDULER", "true").lower() == "true"
+BRIEFING_HOUR = int(os.getenv("BRIEFING_HOUR", 9))
+BRIEFING_MINUTE = int(os.getenv("BRIEFING_MINUTE", 0))
+WEEKLY_REPORT_WEEKDAY = int(os.getenv("WEEKLY_REPORT_WEEKDAY", 4))   # Monday=0 ... Friday=4
+WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", 18))
+WEEKLY_REPORT_MINUTE = int(os.getenv("WEEKLY_REPORT_MINUTE", 0))
+SCHEDULE_WINDOW_MINUTES = 5   # a job still fires if the bot wakes up within this many minutes of its time
 
 MAX_AUDIO_BYTES = 20 * 1024 * 1024        # Telegram bots cannot download files larger than 20 MB
 MAX_TRANSCRIPT_CHARS = 100_000            # safety cap on very long recordings
@@ -213,7 +222,7 @@ def call_chat(messages: list) -> str:
         model=CHAT_MODEL,
         max_tokens=CHAT_MAX_OUTPUT_TOKENS,
     )
-    return (completion.choices[0].message.content or "").strip()
+    return strip_thinking(completion.choices[0].message.content or "")
 
 
 def chat_with_fallback(messages_payload: list, user_text: str) -> str:
@@ -252,6 +261,8 @@ def now_local() -> datetime:
         from zoneinfo import ZoneInfo
         return datetime.now(ZoneInfo(TIMEZONE_NAME))
     except Exception:
+        if TIMEZONE_NAME == "Asia/Kolkata":
+            return datetime.now(timezone(timedelta(hours=5, minutes=30)))
         return datetime.now(timezone.utc)
 
 
@@ -540,6 +551,267 @@ async def process_audio(bot, chat_id, user_id, file_id, filename, caption):
 
 
 # ---------------------------------------------------------------------------
+# DAILY BRIEFING + WEEKLY REPORT (own scheduler: no APScheduler / job-queue extra needed)
+# ---------------------------------------------------------------------------
+LABEL_COMMITMENT = " - Commitment:"
+LABEL_DATE = " - Date/deadline:"
+LABEL_REQUIREMENT = " - Client requirement:"
+LABEL_SUMMARY = " - Summary:"
+ACTION_LABELS = (LABEL_COMMITMENT, LABEL_DATE, LABEL_REQUIREMENT)
+CALL_LABELS = ACTION_LABELS + (LABEL_SUMMARY,)
+
+
+def parse_created_at(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def get_memory_records(user_id: str) -> list:
+    """All stored memories for the user as dicts (id, memory, created_at), newest first."""
+    try:
+        raw = memory.get_all(filters={"user_id": user_id}, limit=500)
+    except TypeError:
+        raw = memory.get_all(filters={"user_id": user_id})
+
+    entries = raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+    records = []
+    for e in entries:
+        if isinstance(e, dict) and e.get("memory"):
+            records.append({
+                "id": e.get("id"),
+                "memory": e["memory"],
+                "created_at": parse_created_at(e.get("created_at")),
+            })
+    oldest = datetime.min.replace(tzinfo=timezone.utc)
+    records.sort(key=lambda r: r["created_at"] or oldest, reverse=True)
+    return records
+
+
+def record_date(record):
+    """The day a memory was recorded: created_at if present, else a date written in its text."""
+    if record["created_at"]:
+        return record["created_at"].astimezone(now_local().tzinfo).date()
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", record["memory"])
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    return None
+
+
+def item_line(record) -> str:
+    d = record_date(record)
+    has_date_in_text = re.search(r"\d{4}-\d{2}-\d{2}", record["memory"])
+    prefix = f"[{d.isoformat()}] " if d and not has_date_in_text else ""
+    return f"- {prefix}{record['memory'][:220]}"
+
+
+def has_label(record, labels) -> bool:
+    return any(label in record["memory"] for label in labels)
+
+
+REPORT_INSTRUCTIONS = {
+    "daily": (
+        "Write a concise morning briefing for your employer. Use ONLY the saved items provided; never invent "
+        "tasks, dates or people. Items show the day they were recorded. Group them under short headings "
+        "(skip any heading with nothing under it): 'Due today or overdue', 'Coming up', 'Open commitments', "
+        "'Client requirements to keep in mind'. Convert any relative dates using today's date. "
+        "Keep it under 250 words, plain text, no markdown symbols."
+    ),
+    "weekly": (
+        "Write a concise weekly report for your employer covering the last 7 days. Use ONLY the saved items "
+        "provided; never invent anything. Use these headings (skip any with nothing under it): "
+        "'Calls and conversations this week', 'Commitments made', 'Coming up next week', "
+        "'Client requirements'. Keep it under 300 words, plain text, no markdown symbols."
+    ),
+}
+REPORT_TITLES = {"daily": "Morning briefing", "weekly": "Weekly report"}
+REPORT_EMPTY = {
+    "daily": "Good morning. I have no open commitments or deadlines saved yet. Send me a call recording, "
+             "or tell me what is on your plate, and I will track it for you.",
+    "weekly": "No calls, commitments or deadlines were saved in the last 7 days, so there is nothing to report yet.",
+}
+
+
+def generate_report(kind: str, records: list) -> str:
+    """Build the briefing/report text. Uses the LLM only when there is real data to summarise."""
+    now = now_local()
+    today_text = now.strftime("%A, %d %B %Y")
+    title = f"{REPORT_TITLES[kind]} - {today_text}"
+
+    if kind == "daily":
+        items = [r for r in records if has_label(r, ACTION_LABELS)][:30]
+        extra = [r for r in records if not has_label(r, CALL_LABELS)][:5]
+    else:
+        cutoff = now.date() - timedelta(days=7)
+        recent = [r for r in records if has_label(r, CALL_LABELS) and (record_date(r) or date.min) >= cutoff][:40]
+        recent_ids = {id(r) for r in recent}
+        upcoming = [r for r in records if has_label(r, (LABEL_DATE,)) and id(r) not in recent_ids][:15]
+        items = recent + upcoming
+        extra = []
+
+    if not items:
+        return f"{title}\n\n{REPORT_EMPTY[kind]}"
+
+    lines = [item_line(r) for r in items]
+    background = [item_line(r) for r in extra]
+    user_content = f"Today is {today_text}.\n\nSaved items:\n" + "\n".join(lines)
+    if background:
+        user_content += "\n\nBackground facts about your employer:\n" + "\n".join(background)
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT[:2000] + "\n\n" + REPORT_INSTRUCTIONS[kind]},
+        {"role": "user", "content": user_content},
+    ]
+    for attempt in range(2):
+        try:
+            text = call_chat(messages)
+            if text:
+                return f"{title}\n\n{text}"
+            break
+        except Exception as e:
+            if is_rate_limit_error(e) and attempt == 0:
+                logger.warning("[Report] Rate limited, retrying in 20s")
+                time.sleep(20)
+            else:
+                logger.error(f"[Report] AI summary failed: {e}")
+                break
+
+    # AI unavailable: still deliver the raw saved items so the report is never empty
+    return f"{title}\n\n(AI summary unavailable right now. Here are your saved items.)\n" + "\n".join(lines)
+
+
+async def deliver_report(bot, chat_id, user_id: str, kind: str):
+    records = await asyncio.to_thread(get_memory_records, user_id)
+    text = await asyncio.to_thread(generate_report, kind, records)
+    await send_long(bot, chat_id, text)
+
+
+def due_jobs(now: datetime, last_run: dict) -> list:
+    """Which scheduled reports should fire right now. Pure function so it is easy to test."""
+    due = []
+    today = now.date().isoformat()
+    minutes_now = now.hour * 60 + now.minute
+
+    daily_at = BRIEFING_HOUR * 60 + BRIEFING_MINUTE
+    if daily_at <= minutes_now < daily_at + SCHEDULE_WINDOW_MINUTES and last_run.get("daily") != today:
+        due.append("daily")
+
+    weekly_at = WEEKLY_REPORT_HOUR * 60 + WEEKLY_REPORT_MINUTE
+    if (now.weekday() == WEEKLY_REPORT_WEEKDAY
+            and weekly_at <= minutes_now < weekly_at + SCHEDULE_WINDOW_MINUTES
+            and last_run.get("weekly") != today):
+        due.append("weekly")
+    return due
+
+
+async def scheduler_loop(app):
+    last_run = {}
+    logger.info(
+        f"[Scheduler] Started. Daily briefing {BRIEFING_HOUR:02d}:{BRIEFING_MINUTE:02d}, "
+        f"weekly report weekday={WEEKLY_REPORT_WEEKDAY} at {WEEKLY_REPORT_HOUR:02d}:{WEEKLY_REPORT_MINUTE:02d} "
+        f"({TIMEZONE_NAME})."
+    )
+    while True:
+        try:
+            now = now_local()
+            for kind in due_jobs(now, last_run):
+                last_run[kind] = now.date().isoformat()
+                logger.info(f"[Scheduler] Running {kind} report")
+                try:
+                    await deliver_report(app.bot, int(ALLOWED_USER_ID), ALLOWED_USER_ID, kind)
+                except Exception as e:
+                    logger.error(f"[Scheduler] {kind} report failed: {e}", exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[Scheduler] Loop error: {e}", exc_info=True)
+        await asyncio.sleep(30)
+
+
+async def post_init(app):
+    if ENABLE_SCHEDULER:
+        app.bot_data["scheduler_task"] = asyncio.create_task(scheduler_loop(app))
+
+
+async def post_shutdown(app):
+    task = app.bot_data.get("scheduler_task")
+    if task:
+        task.cancel()
+
+
+async def briefing_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("Access restricted.")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    user_id = str(update.effective_user.id).strip()
+    await deliver_report(context.bot, update.effective_chat.id, user_id, "daily")
+
+
+async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("Access restricted.")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    user_id = str(update.effective_user.id).strip()
+    await deliver_report(context.bot, update.effective_chat.id, user_id, "weekly")
+
+
+async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List the newest saved memories so you can remove outdated ones with /forget <number>."""
+    if not is_authorized(update):
+        await update.message.reply_text("Access restricted.")
+        return
+    user_id = str(update.effective_user.id).strip()
+    try:
+        records = await asyncio.to_thread(get_memory_records, user_id)
+    except Exception as e:
+        await update.message.reply_text(f"Could not read memory: {e}")
+        return
+    if not records:
+        await update.message.reply_text("No memories saved yet.")
+        return
+
+    shown = records[:20]
+    context.application.bot_data["memory_listing"] = [r["id"] for r in shown]
+    lines = [f"{i}. {r['memory'][:150]}" for i, r in enumerate(shown, start=1)]
+    header = f"Newest {len(shown)} of {len(records)} memories:\n\n"
+    footer = "\n\nRemove one with /forget <number>, for example /forget 3."
+    await send_long(context.bot, update.effective_chat.id, header + "\n".join(lines) + footer)
+
+
+async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("Access restricted.")
+        return
+    listing = context.application.bot_data.get("memory_listing")
+    if not listing:
+        await update.message.reply_text("Run /memories first, then use /forget <number>.")
+        return
+    try:
+        index = int(context.args[0])
+        memory_id = listing[index - 1]
+        if index < 1 or not memory_id:
+            raise ValueError
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /forget <number> using a number from /memories.")
+        return
+    try:
+        await asyncio.to_thread(memory.delete, memory_id)
+        listing[index - 1] = None   # that number can no longer be reused by mistake
+        await update.message.reply_text(f"Deleted memory {index}.")
+    except Exception as e:
+        await update.message.reply_text(f"Could not delete it: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -549,7 +821,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "AI Personal Employee operational on Render Cloud. How can I assist you today?\n"
         "Send a short voice note and I'll answer it like a message. Send a longer voice note or call recording "
-        "and I'll transcribe it, summarise it, and save the action items."
+        "and I'll transcribe it, summarise it, and save the action items.\n"
+        "Commands: /briefing, /weekly, /memories, /forget <number>."
     )
 
 
@@ -747,9 +1020,19 @@ def main():
     print(f"Health server successfully bound to port {PORT}")
 
     print(f"Starting AI Employee for User ID: {ALLOWED_USER_ID}...")
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("briefing", briefing_command))
+    app.add_handler(CommandHandler("weekly", weekly_command))
+    app.add_handler(CommandHandler("memories", memories_command))
+    app.add_handler(CommandHandler("forget", forget_command))
     app.add_handler(MessageHandler(build_audio_filter(), handle_audio))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_error_handler(error_handler)
