@@ -6,6 +6,8 @@ os.environ["MEM0_TELEMETRY"] = "False"
 import io
 import re
 import json
+import urllib.request
+import urllib.error
 import time
 import asyncio
 import logging
@@ -39,6 +41,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", 10000))
 
 CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen/qwen3.8-27b")
@@ -63,6 +66,12 @@ WEEKLY_REPORT_WEEKDAY = int(os.getenv("WEEKLY_REPORT_WEEKDAY", 4))   # Monday=0 
 WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", 18))
 WEEKLY_REPORT_MINUTE = int(os.getenv("WEEKLY_REPORT_MINUTE", 0))
 SCHEDULE_WINDOW_MINUTES = 5   # a job still fires if the bot wakes up within this many minutes of its time
+
+# --- Web search (Tavily) ----------------------------------------------------
+SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", 4))
+SEARCH_SNIPPET_CHARS = 700        # per result
+SEARCH_TOTAL_CHARS = 3500         # all results together (keeps the prompt well under the token limit)
+MAX_SEARCHES_PER_DAY = int(os.getenv("MAX_SEARCHES_PER_DAY", 30))   # protects the 1,000 free credits/month
 
 MAX_AUDIO_BYTES = 20 * 1024 * 1024        # Telegram bots cannot download files larger than 20 MB
 MAX_TRANSCRIPT_CHARS = 100_000            # safety cap on very long recordings
@@ -251,6 +260,109 @@ async def send_long(bot, chat_id, text: str):
     text = text or ""
     for i in range(0, len(text), 3900):
         await bot.send_message(chat_id=chat_id, text=text[i:i + 3900])
+
+
+# ---------------------------------------------------------------------------
+# WEB SEARCH (Tavily)
+# ---------------------------------------------------------------------------
+search_counter = {"day": None, "count": 0}
+
+# Only clear "go and look this up" phrasing triggers a search automatically, so ordinary private messages
+# are never sent to a third party by accident. For anything else use /search <question>.
+SEARCH_TRIGGER = re.compile(
+    r"\b(search\s+(for|the\s+web|online|the\s+internet)|look\s?up|google\s+(it|this|for)|"
+    r"latest\s+news|news\s+(about|on)|what'?s\s+the\s+latest|find\s+out\s+(about|what|who|when))\b",
+    re.IGNORECASE,
+)
+
+
+def wants_web_search(text: str) -> bool:
+    return bool(SEARCH_TRIGGER.search(text))
+
+
+def take_search_slot() -> bool:
+    """Daily cap so a busy day cannot burn through the free monthly credits."""
+    today = now_local().date().isoformat()
+    if search_counter["day"] != today:
+        search_counter["day"], search_counter["count"] = today, 0
+    if search_counter["count"] >= MAX_SEARCHES_PER_DAY:
+        return False
+    search_counter["count"] += 1
+    return True
+
+
+def tavily_search(query: str):
+    """Returns (results, error). Exactly one of them is meaningful."""
+    if not TAVILY_API_KEY:
+        return [], "the TAVILY_API_KEY is not set"
+
+    payload = {"query": query[:380], "max_results": SEARCH_MAX_RESULTS, "search_depth": "basic"}
+    request = urllib.request.Request(
+        "https://api.tavily.com/search",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {TAVILY_API_KEY}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        return data.get("results") or [], None
+    except urllib.error.HTTPError as e:
+        reasons = {
+            400: "the search request was rejected",
+            401: "the Tavily API key is invalid",
+            429: "Tavily's rate limit was hit",
+            432: "the monthly Tavily credit limit was reached",
+            433: "the monthly Tavily credit limit was reached",
+        }
+        logger.error(f"[Search] Tavily HTTP {e.code}")
+        return [], reasons.get(e.code, f"Tavily returned an error (HTTP {e.code})")
+    except Exception as e:
+        logger.error(f"[Search] Request failed: {type(e).__name__}: {e}")
+        return [], "the search service could not be reached"
+
+
+def format_search_context(results: list) -> str:
+    blocks = []
+    for i, r in enumerate(results, start=1):
+        title = (r.get("title") or "").strip()[:120]
+        url = (r.get("url") or "").strip()
+        content = " ".join((r.get("content") or "").split())[:SEARCH_SNIPPET_CHARS]
+        blocks.append(f"[{i}] {title} ({url})\n{content}")
+    body = "\n\n".join(blocks)[:SEARCH_TOTAL_CHARS]
+    return (
+        "\n\n### LIVE WEB SEARCH RESULTS (retrieved just now):\n" + body + "\n\n"
+        "Directive: Use these results for current facts. Cite sources as [1], [2] and include a link when useful. "
+        "If the results do not answer the question, say so instead of guessing. "
+        "Never present anything as a web result unless it appears above."
+    )
+
+
+async def run_search_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
+    """Search the web, then answer using the results AND the user's saved memory."""
+    chat_id = update.effective_chat.id
+    if not TAVILY_API_KEY:
+        await update.message.reply_text("Web search isn't set up yet. Add TAVILY_API_KEY in Render's Environment tab.")
+        return
+    if not take_search_slot():
+        await update.message.reply_text(
+            f"I've reached today's limit of {MAX_SEARCHES_PER_DAY} web searches to protect your monthly credits. "
+            "Raise MAX_SEARCHES_PER_DAY in Render if you want more."
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    results, error = await asyncio.to_thread(tavily_search, query)
+
+    if error or not results:
+        reason = error or "no results came back"
+        note = f"Note: live web search didn't work ({reason}), so this answer comes from memory and general knowledge and may be out of date."
+        await process_user_text(update, context, query, search_note=note, save_memory=False)
+        return
+
+    await process_user_text(
+        update, context, query, search_context=format_search_context(results), save_memory=False
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1052,7 +1164,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "AI Personal Employee operational on Render Cloud. How can I assist you today?\n"
         "Send a short voice note and I'll answer it like a message. Send a longer voice note or call recording "
         "and I'll transcribe it, summarise it, and save the action items.\n"
-        "Commands: /briefing, /weekly, /schedule, /memories, /forget <number>.\n"
+        "Commands: /search <question>, /briefing, /weekly, /schedule, /memories, /forget <number>.\n"
         "You can also say things like \"move my briefing to 8:30 AM\"."
     )
 
@@ -1109,10 +1221,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_text = update.message.text.strip()
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    # Schedule changes are handled first; otherwise explicit "search for ..." style requests use the web
+    if parse_schedule_request(user_text) is None and wants_web_search(user_text):
+        await run_search_turn(update, context, user_text[:300])
+        return
+
     await process_user_text(update, context, user_text)
 
 
-async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("Access restricted.")
+        return
+    query = " ".join(context.args).strip()
+    if not query:
+        await update.message.reply_text("Usage: /search <what to look up>, for example /search latest GST rate changes")
+        return
+    await run_search_turn(update, context, query[:300])
+
+
+async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str,
+                            search_context: str = "", search_note: str = "", save_memory: bool = True):
     """Core assistant + memory pipeline, shared by typed messages and short voice notes."""
     user_id = str(update.effective_user.id).strip()
 
@@ -1149,6 +1279,9 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             f"Directive: Use the facts above as ground-truth context about your employer."
         )
 
+    if search_context:
+        augmented_system += search_context
+
     # 3. SLIDING CONVERSATION WINDOW
     if user_id not in chat_history:
         chat_history[user_id] = []
@@ -1165,9 +1298,13 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     chat_history[user_id] = chat_history[user_id][-HISTORY_MESSAGES * 2:]
 
     # 5. SEND REPLY
+    if search_note:
+        reply_text = f"{search_note}\n\n{reply_text}"
     await update.message.reply_text(reply_text)
 
-    # 6. BACKGROUND MEMORY SAVE
+    # 6. BACKGROUND MEMORY SAVE (skipped for web-search turns so lookups don't clutter memory)
+    if not save_memory:
+        return
     known = {m.strip().lower() for m in unique_memories}
 
     def save_memory_task():
@@ -1266,6 +1403,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("schedule", schedule_command))
     app.add_handler(CommandHandler("briefing", briefing_command))
     app.add_handler(CommandHandler("weekly", weekly_command))
