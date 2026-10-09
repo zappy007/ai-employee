@@ -1196,8 +1196,10 @@ NUM_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five":
 PART_OF_DAY_DEFAULT = {"morning": (9, 0), "afternoon": (15, 0), "evening": (18, 0), "night": (21, 0), "tonight": (21, 0)}
 
 REMIND_START = re.compile(
-    r"^\s*(?:(?:hey|hi|hello|ok|okay|please|kindly|also|can you|could you|would you|will you)[,\s]+)*"
-    r"(?:remind me|(?:set|add|create|make)\s+(?:a\s+|an\s+)?reminder)\b[\s,:\-]*",
+    r"^\s*(?:(?:hey|hi|hello|ok|okay|yo)\b[A-Za-z' ]{0,30}[,:]\s*)?"        # "Hey bot, ..."
+    r"(?:(?:hey|hi|hello|ok|okay|please|kindly|also|just|can you|could you|would you|will you)[,\s]+)*"
+    r"(?:remind me|reminder\s+(?=to\b|for\b|about\b)|remind\s+(?=to\b|about\b)|"
+    r"(?:set|add|create|make)\s+(?:a\s+|an\s+)?reminder)\b[\s,:\-]*",
     re.IGNORECASE,
 )
 LIST_RE = re.compile(
@@ -1431,14 +1433,16 @@ def extract_reminder_text(rest: str, spans: list) -> str:
         for i in range(start, end):
             chars[i] = " "
     masked = "".join(chars)
-    m = re.search(r"\b(?:to|about|that)\b\s+", masked.lower())
+    # "to/about/that" only introduces the reminder text when it comes first (after any leftover time words);
+    # a "to" inside the text itself ("go to Jaipur") must stay.
+    m = re.match(r"\s*(?:(?:on|at|by|in|for)\s+)*(?:to|about|that)\b\s+", masked.lower())
     text = masked[m.end():] if m else masked
-    text = re.sub(r"\s+", " ", text).strip(" ,.;:-")
+    text = re.sub(r"\s+", " ", text).strip(" ,.;:-?!")
     previous = None
     while previous != text:
         previous = text
-        text = re.sub(r"^(?:on|at|by|in|for|to|about|that)\s+", "", text, flags=re.IGNORECASE).strip(" ,.;:-")
-        text = re.sub(r"\s+(?:on|at|by|in|for|to)$", "", text, flags=re.IGNORECASE).strip(" ,.;:-")
+        text = re.sub(r"^(?:on|at|by|in|for|to|about|that)\s+", "", text, flags=re.IGNORECASE).strip(" ,.;:-?!")
+        text = re.sub(r"\s+(?:on|at|by|in|for|to)$", "", text, flags=re.IGNORECASE).strip(" ,.;:-?!")
     return text[:1].upper() + text[1:] if text else ""
 
 
