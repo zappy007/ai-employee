@@ -65,7 +65,7 @@ BRIEFING_MINUTE = int(os.getenv("BRIEFING_MINUTE", 0))
 WEEKLY_REPORT_WEEKDAY = int(os.getenv("WEEKLY_REPORT_WEEKDAY", 4))   # Monday=0 ... Friday=4
 WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", 18))
 WEEKLY_REPORT_MINUTE = int(os.getenv("WEEKLY_REPORT_MINUTE", 0))
-SCHEDULE_WINDOW_MINUTES = 5   # a job still fires if the bot wakes up within this many minutes of its time
+SCHEDULE_WINDOW_MINUTES = int(os.getenv("CATCH_UP_MINUTES", 60))   # a report still goes out if the bot wakes up this many minutes after its time
 
 # --- Web search (Tavily) ----------------------------------------------------
 SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", 4))
@@ -799,10 +799,10 @@ def generate_report(kind: str, records: list) -> str:
     return f"{title}\n\n(AI summary unavailable right now. Here are your saved items.)\n" + "\n".join(lines)
 
 
-async def deliver_report(bot, chat_id, user_id: str, kind: str):
+async def deliver_report(bot, chat_id, user_id: str, kind: str, prefix: str = ""):
     records = await asyncio.to_thread(get_memory_records, user_id)
     text = await asyncio.to_thread(generate_report, kind, records)
-    await send_long(bot, chat_id, text)
+    await send_long(bot, chat_id, prefix + text)
 
 
 # ----- Editable schedule (change it by chatting; saved in Qdrant so it survives restarts) -----
@@ -840,14 +840,8 @@ def get_qdrant():
 def load_schedule():
     """Load the saved schedule from Qdrant (falls back to the defaults if unavailable)."""
     try:
-        from qdrant_client.models import VectorParams, Distance
+        ensure_settings_collection()
         client = get_qdrant()
-        names = [c.name for c in client.get_collections().collections]
-        if SETTINGS_COLLECTION not in names:
-            client.create_collection(
-                collection_name=SETTINGS_COLLECTION,
-                vectors_config=VectorParams(size=1, distance=Distance.DOT),
-            )
         points = client.retrieve(collection_name=SETTINGS_COLLECTION, ids=[SETTINGS_POINT_ID], with_payload=True)
         if points and points[0].payload and isinstance(points[0].payload.get("schedule"), dict):
             saved = points[0].payload["schedule"]
@@ -872,6 +866,98 @@ def save_schedule():
     except Exception as e:
         logger.error(f"[Scheduler] Could not save schedule: {e}")
         return False
+
+
+STATE_POINT_ID = 2          # holds {"last_run": {...}}
+REMINDERS_POINT_ID = 3      # holds {"next_id": n, "items": [...]}
+settings_collection_ready = False
+
+
+def ensure_settings_collection():
+    """Create the small settings collection once (it also stores the schedule and reminders)."""
+    global settings_collection_ready
+    if settings_collection_ready:
+        return
+    from qdrant_client.models import VectorParams, Distance
+    client = get_qdrant()
+    names = [c.name for c in client.get_collections().collections]
+    if SETTINGS_COLLECTION not in names:
+        client.create_collection(
+            collection_name=SETTINGS_COLLECTION,
+            vectors_config=VectorParams(size=1, distance=Distance.DOT),
+        )
+    settings_collection_ready = True
+
+
+def load_point(point_id: int) -> dict:
+    try:
+        ensure_settings_collection()
+        points = get_qdrant().retrieve(collection_name=SETTINGS_COLLECTION, ids=[point_id], with_payload=True)
+        if points and points[0].payload:
+            return dict(points[0].payload)
+    except Exception as e:
+        logger.warning(f"[Settings] Could not load point {point_id}: {e}")
+    return {}
+
+
+def save_point(point_id: int, payload: dict) -> bool:
+    try:
+        ensure_settings_collection()
+        from qdrant_client.models import PointStruct
+        get_qdrant().upsert(
+            collection_name=SETTINGS_COLLECTION,
+            points=[PointStruct(id=point_id, vector=[0.0], payload=payload)],
+        )
+        return True
+    except Exception as e:
+        logger.error(f"[Settings] Could not save point {point_id}: {e}")
+        return False
+
+
+def save_state() -> bool:
+    """Remember which reports were already sent today, so a restart never skips or repeats one."""
+    return save_point(STATE_POINT_ID, {"last_run": dict(last_run)})
+
+
+def parse_iso(value: str) -> datetime:
+    dt = datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=now_local().tzinfo)
+
+
+def load_state_and_reminders():
+    """Called once at startup."""
+    saved = load_point(STATE_POINT_ID).get("last_run")
+    if isinstance(saved, dict):
+        for kind in ("daily", "weekly"):
+            if isinstance(saved.get(kind), str):
+                last_run[kind] = saved[kind]
+
+    data = load_point(REMINDERS_POINT_ID)
+    clean = []
+    for item in data.get("items", []) if isinstance(data.get("items"), list) else []:
+        try:
+            if (isinstance(item, dict) and isinstance(item.get("text"), str)
+                    and item.get("repeat") in (None, "daily", "weekdays", "weekly")):
+                parse_iso(item["due"])
+                clean.append({"id": int(item["id"]), "text": item["text"],
+                              "due": item["due"], "repeat": item.get("repeat")})
+        except Exception:
+            continue
+    reminders["items"] = clean
+    reminders["next_id"] = max(int(data.get("next_id", 1) or 1), max([i["id"] for i in clean], default=0) + 1)
+    logger.info(f"[Startup] Loaded {len(clean)} reminder(s); last_run={last_run}")
+
+
+def reset_last_run_after_change(kind: str):
+    """After the user moves a time: don't fire instantly for a time already past today."""
+    now = now_local()
+    entry = schedule[kind]
+    scheduled = entry["hour"] * 60 + entry["minute"]
+    applies_today = kind == "daily" or now.weekday() == entry.get("weekday")
+    if applies_today and now.hour * 60 + now.minute >= scheduled:
+        last_run[kind] = now.date().isoformat()
+    else:
+        last_run.pop(kind, None)
 
 
 def tz_label() -> str:
@@ -1012,9 +1098,10 @@ async def apply_schedule_change(change: dict) -> str:
             entry["hour"], entry["minute"] = change["hour"], change["minute"]
         if "weekday" in change:
             entry["weekday"] = change["weekday"]
-    last_run.pop(kind, None)   # lets the new time fire today if it is still ahead
+    reset_last_run_after_change(kind)   # a new time that is still ahead fires today; one already past waits
 
     saved = await asyncio.to_thread(save_schedule)
+    await asyncio.to_thread(save_state)
 
     if not entry["enabled"]:
         reply = f"Okay, your {name} is turned off. Say \"turn on my {name}\" any time to bring it back."
@@ -1050,18 +1137,37 @@ def due_jobs(now: datetime, last_run: dict) -> list:
     return due
 
 
+def lateness_minutes(kind: str, now: datetime) -> int:
+    entry = schedule[kind]
+    return now.hour * 60 + now.minute - (entry["hour"] * 60 + entry["minute"])
+
+
 async def scheduler_loop(app):
     logger.info(f"[Scheduler] Started.\n{format_schedule().splitlines()[0]}\n{format_schedule().splitlines()[1]}")
+    attempts = {}
     while True:
         try:
             now = now_local()
-            for kind in due_jobs(now, last_run):
-                last_run[kind] = now.date().isoformat()
-                logger.info(f"[Scheduler] Running {kind} report")
-                try:
-                    await deliver_report(app.bot, int(ALLOWED_USER_ID), ALLOWED_USER_ID, kind)
-                except Exception as e:
-                    logger.error(f"[Scheduler] {kind} report failed: {e}", exc_info=True)
+            today = now.date().isoformat()
+            if ENABLE_SCHEDULER:
+                for kind in due_jobs(now, last_run):
+                    key = f"{kind}:{today}"
+                    attempts[key] = attempts.get(key, 0) + 1
+                    late = lateness_minutes(kind, now)
+                    prefix = f"(Sent {late} minutes late because I was offline or restarting.)\n\n" if late >= 10 else ""
+                    logger.info(f"[Scheduler] Running {kind} report (attempt {attempts[key]})")
+                    try:
+                        await deliver_report(app.bot, int(ALLOWED_USER_ID), ALLOWED_USER_ID, kind, prefix)
+                        last_run[kind] = today
+                        await asyncio.to_thread(save_state)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.error(f"[Scheduler] {kind} report failed: {e}", exc_info=True)
+                        if attempts[key] >= 3:       # give up for today rather than retry forever
+                            last_run[kind] = today
+                            await asyncio.to_thread(save_state)
+            await fire_due_reminders(app.bot, now)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1069,16 +1175,497 @@ async def scheduler_loop(app):
         await asyncio.sleep(30)
 
 
+# ---------------------------------------------------------------------------
+# REMINDERS: "remind me at 3 PM to call Amit". Saved in Qdrant, so they survive restarts.
+# A time with AM/PM is always honoured exactly. A bare "at 3" means the next time the clock hits 3.
+# ---------------------------------------------------------------------------
+reminders = {"next_id": 1, "items": []}
+reminders_lock = asyncio.Lock()
+
+MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3, "apr": 4, "april": 4, "may": 5,
+    "jun": 6, "june": 6, "jul": 7, "july": 7, "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+MONTH_PATTERN = "|".join(sorted(MONTHS, key=len, reverse=True))
+WEEKDAY_PATTERN = "|".join(sorted(WEEKDAY_LOOKUP, key=len, reverse=True))
+NUM_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+             "eight": 8, "nine": 9, "ten": 10, "fifteen": 15, "twenty": 20, "thirty": 30}
+PART_OF_DAY_DEFAULT = {"morning": (9, 0), "afternoon": (15, 0), "evening": (18, 0), "night": (21, 0), "tonight": (21, 0)}
+
+REMIND_START = re.compile(
+    r"^\s*(?:(?:hey|hi|hello|ok|okay|please|kindly|also|can you|could you|would you|will you)[,\s]+)*"
+    r"(?:remind me|(?:set|add|create|make)\s+(?:a\s+|an\s+)?reminder)\b[\s,:\-]*",
+    re.IGNORECASE,
+)
+LIST_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:(?:show|list|view|see|check|display)\b.*\breminders?\b|"
+    r"(?:what|which)\b.*\breminders?\b|(?:do i have|any|how many)\b.*\breminders?\b|"
+    r"(?:my\s+)?reminders\s*\??\s*$)",
+    re.IGNORECASE,
+)
+CANCEL_RE = re.compile(r"^\s*(?:please\s+)?(?:cancel|delete|remove|clear|drop)\b.*\breminders?\b", re.IGNORECASE)
+REL_RE = re.compile(
+    r"\bin\s+(half an?|an?|\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty)\s*"
+    r"(minutes?|mins?|hours?|hrs?|days?|weeks?)\b"
+)
+
+
+class ReminderProblem(Exception):
+    """A reminder request that cannot be scheduled; the message is shown to the user."""
+
+
+def fmt_due(dt: datetime, now: datetime = None) -> str:
+    now = now or now_local()
+    day = f"{dt.strftime('%a')} {dt.day} {dt.strftime('%b')}"
+    if dt.date() == now.date():
+        day = f"today, {day}"
+    elif dt.date() == now.date() + timedelta(days=1):
+        day = f"tomorrow, {day}"
+    return f"{day} at {fmt_time(dt.hour, dt.minute)} {tz_label()}"
+
+
+def repeat_label(repeat, due: datetime) -> str:
+    if repeat == "daily":
+        return "every day"
+    if repeat == "weekdays":
+        return "every weekday (Mon-Fri)"
+    if repeat == "weekly":
+        return f"every {WEEKDAY_NAMES[due.weekday()]}"
+    return ""
+
+
+def next_due(due: datetime, repeat, now: datetime) -> datetime:
+    nxt = due
+    while nxt <= now:
+        if repeat == "daily":
+            nxt += timedelta(days=1)
+        elif repeat == "weekdays":
+            nxt += timedelta(days=1)
+            while nxt.weekday() >= 5:
+                nxt += timedelta(days=1)
+        elif repeat == "weekly":
+            nxt += timedelta(days=7)
+        else:
+            break
+    return nxt
+
+
+def find_time_phrase(low: str):
+    """Earliest clock time in the text: (hour, minute, meridiem or None, span) or None."""
+    if (m := re.search(r"\bnoon\b", low)):
+        return 12, 0, "p", m.span()
+    if (m := re.search(r"\bmidnight\b", low)):
+        return 12, 0, "a", m.span()
+    patterns = (
+        r"(?:\bat\s+|@\s*)?\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)(?![a-z])",
+        r"(?:\bat\s+)?\b(\d{1,2}):(\d{2})\b()",
+        r"\bat\s+(\d{1,2})\b()()(?![:\d])(?:\s*o'?clock)?",
+    )
+    best = None
+    for p in patterns:
+        m = re.search(p, low)
+        if m and (best is None or m.start() < best.start()):
+            best = m
+    if not best:
+        return None
+    hour = int(best.group(1))
+    minute = int(best.group(2)) if best.group(2) else 0
+    meridiem = best.group(3)[0] if best.group(3) else None
+    return hour, minute, meridiem, best.span()
+
+
+def resolve_calendar_date(day: int, month: int, year, today: date):
+    try:
+        if year:
+            return date(year, month, day)
+        d = date(today.year, month, day)
+        return d if d >= today else date(today.year + 1, month, day)
+    except ValueError:
+        return None
+
+
+def find_date_phrase(low: str, today: date):
+    """Returns ({'kind':..., ...}, span) or (None, None). Raises ReminderProblem for impossible dates."""
+    if (m := re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", low)):
+        d = resolve_calendar_date(int(m.group(3)), int(m.group(2)), int(m.group(1)), today)
+        if not d:
+            raise ReminderProblem("I couldn't understand that date.")
+        return {"kind": "date", "date": d}, m.span()
+
+    if (m := re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?({MONTH_PATTERN})\b(?:\s*,?\s*(\d{{4}}))?", low)):
+        d = resolve_calendar_date(int(m.group(1)), MONTHS[m.group(2)], int(m.group(3)) if m.group(3) else None, today)
+        if not d:
+            raise ReminderProblem("I couldn't understand that date.")
+        return {"kind": "date", "date": d}, m.span()
+
+    if (m := re.search(rf"\b({MONTH_PATTERN})\s+(\d{{1,2}})(?:st|nd|rd|th)?\b(?:\s*,?\s*(\d{{4}}))?", low)):
+        d = resolve_calendar_date(int(m.group(2)), MONTHS[m.group(1)], int(m.group(3)) if m.group(3) else None, today)
+        if not d:
+            raise ReminderProblem("I couldn't understand that date.")
+        return {"kind": "date", "date": d}, m.span()
+
+    if (m := re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", low)):
+        day, month = int(m.group(1)), int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else None
+        if year is not None and year < 100:
+            year += 2000
+        d = resolve_calendar_date(day, month, year, today) or (
+            resolve_calendar_date(month, day, year, today) if month > 12 else None)
+        if not d:
+            raise ReminderProblem("I couldn't understand that date. I read dates as day/month, like 15/10.")
+        return {"kind": "date", "date": d}, m.span()
+
+    if (m := re.search(r"\bday after tomorrow\b", low)):
+        return {"kind": "date", "date": today + timedelta(days=2)}, m.span()
+    if (m := re.search(r"\btomorrow\b", low)):
+        return {"kind": "date", "date": today + timedelta(days=1)}, m.span()
+    if (m := re.search(r"\b(?:today|tonight)\b", low)):
+        return {"kind": "today"}, m.span()
+
+    if (m := re.search(rf"\b(?:on\s+)?(?:(next|this)\s+)?({WEEKDAY_PATTERN})\b", low)):
+        return {"kind": "weekday", "weekday": WEEKDAY_LOOKUP[m.group(2)], "next": m.group(1) == "next"}, m.span()
+
+    if (m := re.search(r"\b(?:on\s+)?(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)\b", low)):
+        day = int(m.group(1))
+        for offset in range(0, 4):
+            month_index = today.month - 1 + offset
+            year, month = today.year + month_index // 12, month_index % 12 + 1
+            try:
+                d = date(year, month, day)
+            except ValueError:
+                continue
+            if d >= today:
+                return {"kind": "date", "date": d}, m.span()
+        raise ReminderProblem("I couldn't understand that date.")
+    return None, None
+
+
+def compute_due(now: datetime, date_info, time_info, partofday, repeat):
+    """Decide the exact moment. Returns (due, notes). Raises ReminderProblem or LookupError('need_time')."""
+    notes = []
+    today, tz = now.date(), now.tzinfo
+
+    def at(d, hm):
+        return datetime(d.year, d.month, d.day, hm[0], hm[1], tzinfo=tz)
+
+    ambiguous = False
+    if time_info:
+        hour, minute, meridiem = time_info
+        if minute > 59:
+            raise ReminderProblem("I couldn't understand that time.")
+        if meridiem:                                   # AM/PM given: honoured exactly
+            if not 1 <= hour <= 12:
+                raise ReminderProblem("I couldn't understand that time.")
+            candidates = [(hour % 12 + (12 if meridiem == "p" else 0), minute)]
+        elif hour >= 13 or hour == 0:                  # 24-hour clock
+            if hour > 23:
+                raise ReminderProblem("I couldn't understand that time.")
+            candidates = [(hour, minute)]
+        else:                                          # bare "3": ambiguous
+            base = hour % 12
+            if partofday in ("afternoon", "evening", "night", "tonight"):
+                candidates = [(base + 12, minute)]
+            elif partofday == "morning":
+                candidates = [(base, minute)]
+            else:
+                candidates, ambiguous = [(base, minute), (base + 12, minute)], True
+    elif partofday:
+        candidates = [PART_OF_DAY_DEFAULT[partofday]]
+        notes.append(f"You didn't give an exact time, so I used {fmt_time(*candidates[0])}.")
+    elif date_info or repeat:
+        candidates = [(9, 0)]
+        notes.append("You didn't give a time, so I used 9:00 AM.")
+    else:
+        raise LookupError("need_time")
+
+    if date_info is None:                              # time only: the next time that clock hits
+        options = []
+        for hm in candidates:
+            dt = at(today, hm)
+            if dt <= now:
+                dt = at(today + timedelta(days=1), hm)
+            options.append((dt, hm))
+        due, chosen = min(options)
+        if ambiguous:
+            notes.append(f"I read it as {fmt_time(*chosen)}, the next time the clock hits that. Say AM or PM to be exact.")
+        return due, notes
+
+    kind = date_info["kind"]
+    if ambiguous:
+        if kind == "today":
+            ahead = [hm for hm in candidates if at(today, hm) > now]
+            if not ahead:
+                raise ReminderProblem("That time has already passed today. Tell me a later time or add a date.")
+            chosen = ahead[0]
+        else:                                          # a later day: business-hours guess (7-11 AM, otherwise PM)
+            base = candidates[0][0]
+            chosen = candidates[0] if 7 <= base <= 11 else candidates[1]
+        notes.append(f"I read it as {fmt_time(*chosen)}. Say AM or PM to be exact.")
+    else:
+        chosen = candidates[0]
+
+    if kind == "today":
+        d = today
+    elif kind == "date":
+        d = date_info["date"]
+    else:
+        d = today
+        for _ in range(9):
+            if d.weekday() == date_info["weekday"] and at(d, chosen) > now and not (date_info["next"] and d == today):
+                break
+            d += timedelta(days=1)
+
+    due = at(d, chosen)
+    if due <= now:
+        raise ReminderProblem("That time has already passed today. Tell me a later time or add a date."
+                              if d == today else "That date and time is in the past.")
+    return due, notes
+
+
+def extract_reminder_text(rest: str, spans: list) -> str:
+    chars = list(rest)
+    for start, end in spans:
+        for i in range(start, end):
+            chars[i] = " "
+    masked = "".join(chars)
+    m = re.search(r"\b(?:to|about|that)\b\s+", masked.lower())
+    text = masked[m.end():] if m else masked
+    text = re.sub(r"\s+", " ", text).strip(" ,.;:-")
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"^(?:on|at|by|in|for|to|about|that)\s+", "", text, flags=re.IGNORECASE).strip(" ,.;:-")
+        text = re.sub(r"\s+(?:on|at|by|in|for|to)$", "", text, flags=re.IGNORECASE).strip(" ,.;:-")
+    return text[:1].upper() + text[1:] if text else ""
+
+
+def parse_new_reminder(rest: str, now: datetime) -> dict:
+    low = rest.lower()
+    masked = list(low)
+    spans = []
+
+    def mask(span):
+        spans.append(span)
+        for i in range(span[0], span[1]):
+            masked[i] = " "
+
+    def cur():
+        return "".join(masked)
+
+    try:
+        # repeat
+        repeat, repeat_weekday = None, None
+        if (m := re.search(r"\bevery\s+weekdays?\b|\bon\s+weekdays\b|\bweekdays\s+(?=at\b|\d)", cur())):
+            repeat = "weekdays"; mask(m.span())
+        elif (m := re.search(rf"\bevery\s+({WEEKDAY_PATTERN})s?\b", cur())):
+            repeat, repeat_weekday = "weekly", WEEKDAY_LOOKUP[m.group(1)]; mask(m.span())
+        elif (m := re.search(r"\bevery\s*day\b|\beach\s+day\b|^\s*daily\b|\bdaily\s+(?=at\b|\d)", cur())):
+            repeat = "daily"; mask(m.span())
+        elif (m := re.search(r"\bevery\s+week\b|^\s*weekly\b|\bweekly\s+(?=at\b|\d)", cur())):
+            repeat = "weekly"; mask(m.span())
+
+        # relative ("in 30 minutes", "in 2 days")
+        rel_due, date_info = None, None
+        if (m := REL_RE.search(cur())):
+            word, unit = m.group(1), m.group(2)
+            qty = 0.5 if word.startswith("half") else (NUM_WORDS.get(word) or float(word))
+            if qty <= 0:
+                raise ReminderProblem("Tell me a time in the future, for example \"in 30 minutes\".")
+            mask(m.span())
+            if unit.startswith("m"):
+                rel_due = now + timedelta(minutes=qty)
+            elif unit.startswith("h"):
+                rel_due = now + timedelta(hours=qty)
+            else:
+                days = int(qty * (7 if unit.startswith("w") else 1))
+                date_info = {"kind": "date", "date": now.date() + timedelta(days=days)}
+
+        if rel_due is not None:
+            due = rel_due.replace(second=0, microsecond=0)
+            notes = []
+            time_info = partofday = None
+        else:
+            # "this morning/afternoon/evening" and "tonight" mean today
+            partofday = None
+            if (m := re.search(r"\bthis\s+(morning|afternoon|evening)\b", cur())):
+                partofday, date_info = m.group(1), {"kind": "today"}; mask(m.span())
+            elif (m := re.search(r"\btonight\b", cur())):
+                partofday, date_info = "tonight", {"kind": "today"}; mask(m.span())
+
+            if date_info is None:
+                date_info, span = find_date_phrase(cur(), now.date())
+                if span:
+                    mask(span)
+                    pm = re.compile(r"\s*(?:in\s+the\s+)?(morning|afternoon|evening|night)\b").match(cur(), span[1])
+                    if pm:
+                        partofday = pm.group(1); mask((span[1], pm.end()))
+            if partofday is None and (m := re.search(r"\bin\s+the\s+(morning|afternoon|evening)\b", cur())):
+                partofday = m.group(1); mask(m.span())
+
+            if repeat == "weekly" and repeat_weekday is not None and date_info is None:
+                date_info = {"kind": "weekday", "weekday": repeat_weekday, "next": False}
+
+            time_found = find_time_phrase(cur())
+            time_info = None
+            if time_found:
+                time_info = time_found[:3]
+                mask(time_found[3])
+
+            try:
+                due, notes = compute_due(now, date_info, time_info, partofday, repeat)
+            except LookupError:
+                return {"action": "need_time"}
+    except ReminderProblem as e:
+        return {"action": "error", "message": str(e)}
+
+    if repeat == "weekdays":
+        while due.weekday() >= 5:
+            due += timedelta(days=1)
+
+    text = extract_reminder_text(rest, spans)
+    if not text:
+        return {"action": "need_text"}
+    return {"action": "add", "text": text[:300], "due": due, "repeat": repeat, "notes": notes}
+
+
+def parse_reminder_request(text: str, now: datetime = None):
+    """Returns a dict for reminder requests (add / list / cancel), or None for ordinary messages."""
+    now = now or now_local()
+    t = text.strip()
+    m = REMIND_START.match(t)
+    if m:
+        return parse_new_reminder(t[m.end():], now)
+    if CANCEL_RE.match(t):
+        low = t.lower()
+        if re.search(r"\ball\b", low):
+            return {"action": "cancel_all"}
+        idm = re.search(r"(?:#|\bnumber\s+|\bno\.?\s*|\breminders?\s+)(\d+)", low) or re.search(r"\b(\d+)\b", low)
+        return {"action": "cancel", "id": int(idm.group(1))} if idm else {"action": "cancel_none"}
+    if LIST_RE.match(t):
+        return {"action": "list"}
+    return None
+
+
+def reminder_snapshot() -> dict:
+    return {"next_id": reminders["next_id"], "items": [dict(i) for i in reminders["items"]]}
+
+
+def save_reminders(snapshot: dict) -> bool:
+    return save_point(REMINDERS_POINT_ID, snapshot)
+
+
+def format_reminders() -> str:
+    items = sorted(reminders["items"], key=lambda r: parse_iso(r["due"]))
+    if not items:
+        return "You have no reminders. Try: \"remind me tomorrow at 10 AM to send the quote\"."
+    now = now_local()
+    lines = []
+    for r in items:
+        due = parse_iso(r["due"])
+        extra = f" (repeats {repeat_label(r.get('repeat'), due)})" if r.get("repeat") else ""
+        lines.append(f"#{r['id']} - {fmt_due(due, now)} - {r['text']}{extra}")
+    return "Your reminders:\n" + "\n".join(lines) + "\n\nCancel one with \"cancel reminder 3\" or all with \"cancel all reminders\"."
+
+
+async def apply_reminder_request(change: dict) -> str:
+    action = change["action"]
+    if action == "need_time":
+        return ("When should I remind you? For example: \"remind me at 3 PM to call Amit\" or "
+                "\"remind me tomorrow at 10 AM to send the quote\".")
+    if action == "need_text":
+        return "What should I remind you about? For example: \"remind me at 3 PM to call Amit\"."
+    if action == "error":
+        return change["message"]
+    if action == "list":
+        return format_reminders()
+    if action == "cancel_none":
+        return "Which reminder? Say \"cancel reminder 3\" using a number from your list.\n\n" + format_reminders()
+
+    async with reminders_lock:
+        if action == "cancel_all":
+            count = len(reminders["items"])
+            reminders["items"].clear()
+            saved = await asyncio.to_thread(save_reminders, reminder_snapshot())
+            reply = f"Cancelled {count} reminder(s)." if count else "You have no reminders to cancel."
+        elif action == "cancel":
+            match = next((r for r in reminders["items"] if r["id"] == change["id"]), None)
+            if not match:
+                return f"I couldn't find reminder #{change['id']}.\n\n" + format_reminders()
+            reminders["items"].remove(match)
+            saved = await asyncio.to_thread(save_reminders, reminder_snapshot())
+            reply = f"Cancelled reminder #{match['id']}: {match['text']}"
+        else:  # add
+            item = {"id": reminders["next_id"], "text": change["text"],
+                    "due": change["due"].isoformat(), "repeat": change["repeat"]}
+            reminders["next_id"] += 1
+            reminders["items"].append(item)
+            saved = await asyncio.to_thread(save_reminders, reminder_snapshot())
+            reply = f"Reminder #{item['id']} set for {fmt_due(change['due'])}: {item['text']}."
+            if change["repeat"]:
+                reply += f" Repeats {repeat_label(change['repeat'], change['due'])}."
+            for note in change["notes"]:
+                reply += f" ({note})"
+
+    if not saved:
+        reply += "\n(Warning: I couldn't save this to the database, so it may be lost if the bot restarts.)"
+    return reply
+
+
+async def fire_due_reminders(bot, now: datetime):
+    """Send every reminder that is due. Reminders missed during downtime are sent late, never lost."""
+    due_items = [r for r in list(reminders["items"]) if parse_iso(r["due"]) <= now]
+    for item in due_items:
+        try:
+            due_dt = parse_iso(item["due"])
+            text = f"Reminder: {item['text']}"
+            if (now - due_dt) >= timedelta(minutes=10):
+                text += f"\n(This was due {fmt_due(due_dt, now)}. I was offline or restarting.)"
+            await send_long(bot, int(ALLOWED_USER_ID), text)
+            async with reminders_lock:
+                if item in reminders["items"]:
+                    if item.get("repeat"):
+                        item["due"] = next_due(due_dt, item["repeat"], now).isoformat()
+                    else:
+                        reminders["items"].remove(item)
+                    await asyncio.to_thread(save_reminders, reminder_snapshot())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[Reminders] Could not deliver reminder #{item.get('id')}: {e}", exc_info=True)
+
+
 async def post_init(app):
-    if ENABLE_SCHEDULER:
-        await asyncio.to_thread(load_schedule)
-        app.bot_data["scheduler_task"] = asyncio.create_task(scheduler_loop(app))
+    await asyncio.to_thread(load_schedule)
+    await asyncio.to_thread(load_state_and_reminders)
+    app.bot_data["scheduler_task"] = asyncio.create_task(scheduler_loop(app))
 
 
 async def post_shutdown(app):
     task = app.bot_data.get("scheduler_task")
     if task:
         task.cancel()
+
+
+async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("Access restricted.")
+        return
+    await update.message.reply_text(format_reminders())
+
+
+async def cancel_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("Access restricted.")
+        return
+    arg = (context.args[0] if context.args else "").lower().lstrip("#")
+    if arg == "all":
+        change = {"action": "cancel_all"}
+    elif arg.isdigit():
+        change = {"action": "cancel", "id": int(arg)}
+    else:
+        change = {"action": "cancel_none"}
+    await update.message.reply_text(await apply_reminder_request(change))
 
 
 async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1164,7 +1751,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "AI Personal Employee operational on Render Cloud. How can I assist you today?\n"
         "Send a short voice note and I'll answer it like a message. Send a longer voice note or call recording "
         "and I'll transcribe it, summarise it, and save the action items.\n"
-        "Commands: /search <question>, /briefing, /weekly, /schedule, /memories, /forget <number>.\n"
+        "Commands: /search <question>, /reminders, /briefing, /weekly, /schedule, /memories, /forget <number>.\n"
+        "Reminders: say \"remind me at 3 PM to call Amit\" or \"remind me tomorrow at 10 AM to send the quote\".\n"
         "You can also say things like \"move my briefing to 8:30 AM\"."
     )
 
@@ -1223,7 +1811,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     # Schedule changes are handled first; otherwise explicit "search for ..." style requests use the web
-    if parse_schedule_request(user_text) is None and wants_web_search(user_text):
+    if (parse_reminder_request(user_text) is None and parse_schedule_request(user_text) is None
+            and wants_web_search(user_text)):
         await run_search_turn(update, context, user_text[:300])
         return
 
@@ -1245,6 +1834,12 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                             search_context: str = "", search_note: str = "", save_memory: bool = True):
     """Core assistant + memory pipeline, shared by typed messages and short voice notes."""
     user_id = str(update.effective_user.id).strip()
+
+    # Reminders ("remind me at 3 PM to call Amit") are handled here, not sent to the AI or saved as a memory
+    reminder_change = parse_reminder_request(user_text)
+    if reminder_change is not None:
+        await update.message.reply_text(await apply_reminder_request(reminder_change))
+        return
 
     # "Move my briefing to 8:30 AM" etc. is handled here, not sent to the AI or saved as a memory
     change = parse_schedule_request(user_text)
@@ -1404,6 +1999,8 @@ def main():
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("reminders", reminders_command))
+    app.add_handler(CommandHandler("cancelreminder", cancel_reminder_command))
     app.add_handler(CommandHandler("schedule", schedule_command))
     app.add_handler(CommandHandler("briefing", briefing_command))
     app.add_handler(CommandHandler("weekly", weekly_command))
@@ -1419,4 +2016,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
