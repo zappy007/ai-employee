@@ -43,6 +43,8 @@ QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", 10000))
+# Seconds to wait before polling Telegram, so the previous Render deploy has shut down first (avoids the Conflict error)
+POLLING_START_DELAY = int(os.getenv("POLLING_START_DELAY", 25))
 
 CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen/qwen3.8-27b")
 # Small fact-extraction call on Groq (short prompt, a few hundred tokens)
@@ -1636,6 +1638,11 @@ async def fire_due_reminders(bot, now: datetime):
 
 
 async def post_init(app):
+    # The health server is already up, so Render marks this deploy healthy and stops the old copy meanwhile.
+    # Polling and the scheduler start only after that, so two copies never poll or send reminders together.
+    if POLLING_START_DELAY > 0:
+        logger.info(f"[Startup] Waiting {POLLING_START_DELAY}s for the previous instance to shut down.")
+        await asyncio.sleep(POLLING_START_DELAY)
     await asyncio.to_thread(load_schedule)
     await asyncio.to_thread(load_state_and_reminders)
     app.bot_data["scheduler_task"] = asyncio.create_task(scheduler_loop(app))
@@ -1645,6 +1652,10 @@ async def post_shutdown(app):
     task = app.bot_data.get("scheduler_task")
     if task:
         task.cancel()
+        try:
+            await task   # let the cancellation finish so no "Task was destroyed but it is pending" noise
+        except BaseException:
+            pass
 
 
 async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1950,6 +1961,10 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 # Global Telegram Error Handler to safely catch and log unhandled exceptions
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if type(context.error).__name__ == "Conflict":
+        logger.warning("[Telegram] Another copy of the bot is polling (normal for a few seconds during a deploy). "
+                       "If this repeats every few seconds, a second instance is running somewhere.")
+        return
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 
