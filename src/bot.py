@@ -48,12 +48,10 @@ POLLING_START_DELAY = int(os.getenv("POLLING_START_DELAY", 25))
 
 CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen/qwen3.8-27b")
 # Small fact-extraction call on Groq (short prompt, a few hundred tokens)
-EXTRACTION_MODEL = os.getenv("EXTRACTION_MODEL", CHAT_MODEL)
 
 # --- Audio / call recording settings ---------------------------------------
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-large-v3")
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "").strip() or None  # e.g. "en" or "hi"; empty = auto-detect
-SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", CHAT_MODEL)
 SEND_TRANSCRIPT_FILE = os.getenv("SEND_TRANSCRIPT_FILE", "true").lower() == "true"
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Asia/Kolkata")
 # Voice notes up to this many seconds are treated as a spoken message to the assistant (answered like text).
@@ -192,6 +190,194 @@ def strip_thinking(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL).strip()
 
 
+# ---------------------------------------------------------------------------
+# MODEL ROUTER + USAGE TRACKING
+# Routine work goes to a small fast model, harder work to a bigger one. Every call is counted (/usage).
+# ---------------------------------------------------------------------------
+ROUTER_ENABLED = os.getenv("ROUTER_ENABLED", "true").lower() == "true"   # false = every call uses CHAT_MODEL (baseline)
+FAST_MODEL = os.getenv("FAST_MODEL", "openai/gpt-oss-20b")
+STRONG_MODEL = os.getenv("STRONG_MODEL", "openai/gpt-oss-120b")
+MEM0_DEFAULT_EXTRACTION_TOKENS = 8270    # input tokens mem0's own extraction prompt needed (from the 413 errors)
+
+TASK_TIERS = {
+    "chat_simple": "fast",
+    "chat_complex": "strong",
+    "extraction": "fast",
+    "analysis": "strong",
+    "report_daily": "fast",
+    "report_weekly": "strong",
+    "summary_combine": "fast",
+}
+COMPLEX_HINTS = re.compile(
+    r"\b(analy[sz]e|analysis|compare|comparison|strateg\w*|plan|draft|write|rewrite|summari[sz]e|explain|"
+    r"evaluate|recommend\w*|proposal|research|review|forecast|budget|negotiat\w*|optimi[sz]e|pros and cons|"
+    r"step[- ]by[- ]step|why|how (?:do|does|should|can|would)|translate|calculat\w*)\b",
+    re.IGNORECASE,
+)
+
+available_models = None      # set at startup from the Groq model list
+usage_data = {}              # {"2026-10-14": {"model||task": {"calls", "fail", "in", "out"}}}
+usage_lock = threading.Lock()
+usage_state = {"dirty": False}
+USAGE_POINT_ID = 4
+USAGE_KEEP_DAYS = 30
+
+
+def classify_chat_task(user_text: str, has_search: bool = False) -> str:
+    """Zero-token heuristic: quality first, so anything that looks like real work goes to the strong model."""
+    if has_search or len(user_text) > 350 or user_text.count("?") >= 2 or "```" in user_text \
+            or COMPLEX_HINTS.search(user_text):
+        return "chat_complex"
+    return "chat_simple"
+
+
+def models_for(task: str, tier: str = None) -> list:
+    """Models to try, in order: the right tier first, the other tier next, CHAT_MODEL last."""
+    if not ROUTER_ENABLED:
+        return [CHAT_MODEL]
+    tier = tier or TASK_TIERS.get(task, "strong")
+    order = [FAST_MODEL, STRONG_MODEL] if tier == "fast" else [STRONG_MODEL, FAST_MODEL]
+    order.append(CHAT_MODEL)
+    result = []
+    for model in order:
+        if model not in result and (available_models is None or model in available_models):
+            result.append(model)
+    return result or [CHAT_MODEL]
+
+
+def _num(value) -> int:
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def record_usage(task: str, model: str, prompt_tokens: int, completion_tokens: int, ok: bool = True):
+    day = now_local().date().isoformat()
+    with usage_lock:
+        entry = usage_data.setdefault(day, {}).setdefault(f"{model}||{task}", {"calls": 0, "fail": 0, "in": 0, "out": 0})
+        if ok:
+            entry["calls"] += 1
+            entry["in"] += prompt_tokens
+            entry["out"] += completion_tokens
+        else:
+            entry["fail"] += 1
+        usage_state["dirty"] = True
+    if ok:
+        logger.info(f"[LLM] task={task} model={model} in={prompt_tokens} out={completion_tokens}")
+    else:
+        logger.warning(f"[LLM] task={task} model={model} failed")
+
+
+def llm_chat(task: str, messages: list, max_tokens: int, temperature: float = None, tier: str = None) -> str:
+    """One entry point for every chat call: routing, usage counting, fallback to another model."""
+    last_error = None
+    for model in models_for(task, tier):
+        for budget in (max_tokens, max_tokens * 3):
+            kwargs = {"model": model, "messages": messages, "max_tokens": budget}
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            try:
+                response = groq_client.chat.completions.create(**kwargs)
+            except Exception as e:
+                last_error = e
+                record_usage(task, model, 0, 0, ok=False)
+                break                                   # try the next model (it has its own rate limit)
+            usage = getattr(response, "usage", None)
+            record_usage(task, model, _num(getattr(usage, "prompt_tokens", 0)), _num(getattr(usage, "completion_tokens", 0)))
+            choice = response.choices[0]
+            text = strip_thinking(choice.message.content or "")
+            if text:
+                return text
+            if getattr(choice, "finish_reason", None) == "length" and budget == max_tokens:
+                continue                                # reasoning used the whole budget: retry with more room
+            break
+    raise last_error or RuntimeError("The model returned an empty answer")
+
+
+def startup_model_check():
+    """Read the model list once so a wrong model name is skipped instead of failing every call."""
+    global available_models
+    try:
+        ids = {m.id for m in groq_client.models.list().data}
+    except Exception as e:
+        logger.warning(f"[Router] Could not read the Groq model list: {e}")
+        return
+    available_models = ids
+    for label, model in (("FAST_MODEL", FAST_MODEL), ("STRONG_MODEL", STRONG_MODEL), ("CHAT_MODEL", CHAT_MODEL)):
+        if model not in ids:
+            logger.warning(f"[Router] {label}={model} is not available to this Groq key and will be skipped.")
+    logger.info(f"[Router] enabled={ROUTER_ENABLED} fast={FAST_MODEL} strong={STRONG_MODEL} fallback={CHAT_MODEL}")
+
+
+def save_usage() -> bool:
+    with usage_lock:
+        days = sorted(usage_data)[-USAGE_KEEP_DAYS:]
+        snapshot = {d: {k: dict(v) for k, v in usage_data[d].items()} for d in days}
+        usage_state["dirty"] = False
+    ok = save_point(USAGE_POINT_ID, {"days": snapshot})
+    if not ok:
+        usage_state["dirty"] = True
+    return ok
+
+
+def load_usage():
+    days = load_point(USAGE_POINT_ID).get("days")
+    if not isinstance(days, dict):
+        return
+    with usage_lock:
+        for day, entries in days.items():
+            if isinstance(entries, dict):
+                usage_data[day] = {k: {f: _num(n) for f, n in v.items()} for k, v in entries.items() if isinstance(v, dict)}
+
+
+def aggregate_usage(days: list):
+    by_model, by_task = {}, {}
+    with usage_lock:
+        for day in days:
+            for key, e in usage_data.get(day, {}).items():
+                model, _, task = key.partition("||")
+                for bucket, name in ((by_model, model), (by_task, task)):
+                    agg = bucket.setdefault(name, {"calls": 0, "fail": 0, "in": 0, "out": 0})
+                    for field in agg:
+                        agg[field] += e.get(field, 0)
+    return by_model, by_task
+
+
+def format_usage() -> str:
+    today = now_local().date()
+    periods = (("Today", [today.isoformat()]),
+               ("Last 7 days", [(today - timedelta(days=i)).isoformat() for i in range(7)]))
+    lines = [f"Model router: {'ON' if ROUTER_ENABLED else 'OFF (every call uses ' + CHAT_MODEL + ')'}"]
+    week_models, week_tasks = {}, {}
+    for title, days in periods:
+        by_model, by_task = aggregate_usage(days)
+        lines.append("")
+        if not by_model:
+            lines.append(f"{title}: no calls yet.")
+            continue
+        lines.append(f"{title}:")
+        for model, e in sorted(by_model.items(), key=lambda kv: -(kv[1]["in"] + kv[1]["out"])):
+            failed = f", {e['fail']} failed" if e["fail"] else ""
+            noun = "call" if e["calls"] == 1 else "calls"
+            lines.append(f"- {model}: {e['calls']} {noun}, {e['in']:,} in / {e['out']:,} out tokens{failed}")
+        if title == "Last 7 days":
+            week_models, week_tasks = by_model, by_task
+
+    total_calls = sum(e["calls"] for e in week_models.values())
+    total_tokens = sum(e["in"] + e["out"] for e in week_models.values())
+    if total_calls and ROUTER_ENABLED:
+        fast = week_models.get(FAST_MODEL, {"calls": 0, "in": 0, "out": 0})
+        lines.append("")
+        lines.append(f"Routing (7 days): {fast['calls'] * 100 // total_calls}% of calls and "
+                     f"{(fast['in'] + fast['out']) * 100 // max(total_tokens, 1)}% of tokens went to the fast model.")
+    extraction = week_tasks.get("extraction")
+    if extraction and extraction["calls"]:
+        average = extraction["in"] / extraction["calls"]
+        if average < MEM0_DEFAULT_EXTRACTION_TOKENS:
+            saved = int((1 - average / MEM0_DEFAULT_EXTRACTION_TOKENS) * 100)
+            lines.append(f"Memory extraction (7 days): {extraction['calls']} calls averaging {int(average):,} input tokens, "
+                         f"versus about {MEM0_DEFAULT_EXTRACTION_TOKENS:,} with mem0's default prompt ({saved}% fewer).")
+    return "\n".join(lines)
+
+
 EXTRACTION_PROMPT = (
     "Extract lasting facts worth remembering about the user from their message: "
     "personal details, preferences, goals, people, projects, schedules, decisions. "
@@ -203,16 +389,15 @@ EXTRACTION_PROMPT = (
 
 def extract_facts(text: str) -> list:
     """Tiny extraction call (a few hundred tokens) instead of mem0's ~8,000-token prompt."""
-    resp = groq_client.chat.completions.create(
-        model=EXTRACTION_MODEL,
-        messages=[
+    content = llm_chat(
+        "extraction",
+        [
             {"role": "system", "content": EXTRACTION_PROMPT},
             {"role": "user", "content": text[:MAX_USER_CHARS]},
         ],
+        max_tokens=600,
         temperature=0,
-        max_tokens=300,
     )
-    content = strip_thinking(resp.choices[0].message.content or "")
     match = re.search(r"\[.*\]", content, flags=re.DOTALL)
     if not match:
         return []
@@ -227,19 +412,14 @@ def build_memory_context(memories: list) -> str:
     return "\n- " + "\n- ".join(trimmed) if trimmed else ""
 
 
-def call_chat(messages: list) -> str:
-    completion = groq_client.chat.completions.create(
-        messages=messages,
-        model=CHAT_MODEL,
-        max_tokens=CHAT_MAX_OUTPUT_TOKENS,
-    )
-    return strip_thinking(completion.choices[0].message.content or "")
+def call_chat(messages: list, task: str = "chat_complex") -> str:
+    return llm_chat(task, messages, max_tokens=CHAT_MAX_OUTPUT_TOKENS)
 
 
-def chat_with_fallback(messages_payload: list, user_text: str) -> str:
+def chat_with_fallback(messages_payload: list, user_text: str, task: str = "chat_complex") -> str:
     """Normal call; on a rate-limit error wait and retry with a minimal prompt."""
     try:
-        return call_chat(messages_payload)
+        return call_chat(messages_payload, task)
     except Exception as e:
         if not is_rate_limit_error(e):
             return f"Processing error: {e}"
@@ -251,7 +431,7 @@ def chat_with_fallback(messages_payload: list, user_text: str) -> str:
         {"role": "user", "content": user_text[:MAX_USER_CHARS]},
     ]
     try:
-        return call_chat(minimal)
+        return call_chat(minimal, task)
     except Exception as e:
         logger.error(f"[Chat] Still rate limited: {e}")
         return "I'm briefly rate limited by my AI provider. Please send that again in about a minute."
@@ -483,10 +663,7 @@ def analyze_chunk(chunk: str, caption: str, today_text: str, depth: int = 0) -> 
     ]
     for attempt in range(3):
         try:
-            resp = groq_client.chat.completions.create(
-                model=SUMMARY_MODEL, messages=messages, temperature=0, max_tokens=900
-            )
-            return parse_analysis(resp.choices[0].message.content or "")
+            return parse_analysis(llm_chat("analysis", messages, max_tokens=1500, temperature=0))
         except Exception as e:
             if is_too_large_error(e) and depth < 2 and len(chunk) > 1500:
                 logger.warning("[Audio] Chunk too large for the limit, splitting it in half.")
@@ -509,17 +686,16 @@ def analyze_chunk(chunk: str, caption: str, today_text: str, depth: int = 0) -> 
 def combine_summaries(summary_text: str) -> str:
     """Turn several partial summaries into one concise meeting summary."""
     try:
-        resp = groq_client.chat.completions.create(
-            model=SUMMARY_MODEL,
-            messages=[
+        combined = llm_chat(
+            "summary_combine",
+            [
                 {"role": "system", "content": "Combine these partial summaries of one call into a single concise "
                                               "meeting summary of at most 6 sentences. Reply with the summary only."},
                 {"role": "user", "content": summary_text[:6000]},
             ],
+            max_tokens=800,
             temperature=0,
-            max_tokens=500,
         )
-        combined = strip_thinking(resp.choices[0].message.content or "")
         return combined or summary_text[:1500]
     except Exception as e:
         logger.warning(f"[Audio] Could not combine summaries: {e}")
@@ -785,7 +961,7 @@ def generate_report(kind: str, records: list) -> str:
     ]
     for attempt in range(2):
         try:
-            text = call_chat(messages)
+            text = call_chat(messages, f"report_{kind}")
             if text:
                 return f"{title}\n\n{text}"
             break
@@ -1147,6 +1323,7 @@ def lateness_minutes(kind: str, now: datetime) -> int:
 async def scheduler_loop(app):
     logger.info(f"[Scheduler] Started.\n{format_schedule().splitlines()[0]}\n{format_schedule().splitlines()[1]}")
     attempts = {}
+    last_usage_save = 0.0
     while True:
         try:
             now = now_local()
@@ -1170,6 +1347,9 @@ async def scheduler_loop(app):
                             last_run[kind] = today
                             await asyncio.to_thread(save_state)
             await fire_due_reminders(app.bot, now)
+            if usage_state["dirty"] and time.monotonic() - last_usage_save >= 60:
+                last_usage_save = time.monotonic()
+                await asyncio.to_thread(save_usage)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1649,6 +1829,8 @@ async def post_init(app):
         await asyncio.sleep(POLLING_START_DELAY)
     await asyncio.to_thread(load_schedule)
     await asyncio.to_thread(load_state_and_reminders)
+    await asyncio.to_thread(load_usage)
+    await asyncio.to_thread(startup_model_check)
     app.bot_data["scheduler_task"] = asyncio.create_task(scheduler_loop(app))
 
 
@@ -1660,6 +1842,15 @@ async def post_shutdown(app):
             await task   # let the cancellation finish so no "Task was destroyed but it is pending" noise
         except BaseException:
             pass
+    if usage_state["dirty"]:
+        await asyncio.to_thread(save_usage)
+
+
+async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("Access restricted.")
+        return
+    await update.message.reply_text(format_usage())
 
 
 async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1766,7 +1957,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "AI Personal Employee operational on Render Cloud. How can I assist you today?\n"
         "Send a short voice note and I'll answer it like a message. Send a longer voice note or call recording "
         "and I'll transcribe it, summarise it, and save the action items.\n"
-        "Commands: /search <question>, /reminders, /briefing, /weekly, /schedule, /memories, /forget <number>.\n"
+        "Commands: /search <question>, /reminders, /usage, /briefing, /weekly, /schedule, /memories, /forget <number>.\n"
         "Reminders: say \"remind me at 3 PM to call Amit\" or \"remind me tomorrow at 10 AM to send the quote\".\n"
         "You can also say things like \"move my briefing to 8:30 AM\"."
     )
@@ -1901,7 +2092,8 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     messages_payload.append({"role": "user", "content": user_text[:MAX_USER_CHARS]})
 
     # 4. INFERENCE VIA GROQ (with rate-limit fallback)
-    reply_text = await asyncio.to_thread(chat_with_fallback, messages_payload, user_text)
+    chat_task = classify_chat_task(user_text, bool(search_context))
+    reply_text = await asyncio.to_thread(chat_with_fallback, messages_payload, user_text, chat_task)
 
     chat_history[user_id].append({"role": "user", "content": user_text[:HISTORY_ITEM_CHARS]})
     chat_history[user_id].append({"role": "assistant", "content": reply_text[:HISTORY_ITEM_CHARS]})
@@ -2018,6 +2210,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("usage", usage_command))
     app.add_handler(CommandHandler("reminders", reminders_command))
     app.add_handler(CommandHandler("cancelreminder", cancel_reminder_command))
     app.add_handler(CommandHandler("schedule", schedule_command))
