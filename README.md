@@ -1,3 +1,6 @@
+## 🏗️ System Architecture
+
+```mermaid
 graph TD
     User((Telegram User)) -->|Text/Voice/Files| Bot[Telegram Bot API]
     Bot --> Dispatcher{Rule-Based Dispatcher}
