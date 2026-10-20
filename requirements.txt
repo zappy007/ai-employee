@@ -75,3 +75,6 @@ typing-inspection==0.4.4
 typing_extensions==4.16.0
 urllib3==2.8.0
 websockets==16.1.1
+google-api-python-client==2.147.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1

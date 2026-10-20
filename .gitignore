@@ -6,3 +6,7 @@ venv/
 __pycache__/
 *.pyc
 .cache/
+
+# Google Workspace credentials (NEVER commit)
+client_secret.json
+token.json
