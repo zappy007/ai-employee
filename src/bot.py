@@ -1,8 +1,6 @@
 import os
-
 # Set telemetry flag BEFORE importing mem0 (mem0 reads it at import time)
 os.environ["MEM0_TELEMETRY"] = "False"
-
 import io
 import re
 import json
@@ -43,6 +41,7 @@ QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", 10000))
+
 # Seconds to wait before polling Telegram, so the previous Render deploy has shut down first (avoids the Conflict error)
 POLLING_START_DELAY = int(os.getenv("POLLING_START_DELAY", 25))
 
@@ -54,6 +53,7 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-large-v3")
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "").strip() or None  # e.g. "en" or "hi"; empty = auto-detect
 SEND_TRANSCRIPT_FILE = os.getenv("SEND_TRANSCRIPT_FILE", "true").lower() == "true"
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Asia/Kolkata")
+
 # Voice notes up to this many seconds are treated as a spoken message to the assistant (answered like text).
 # Longer ones are treated as call recordings (summary + action items). Set to 0 to always treat audio as recordings.
 VOICE_COMMAND_MAX_SECONDS = int(os.getenv("VOICE_COMMAND_MAX_SECONDS", 60))
@@ -78,7 +78,6 @@ MAX_TRANSCRIPT_CHARS = 100_000            # safety cap on very long recordings
 TRANSCRIPT_CHUNK_CHARS = int(os.getenv("TRANSCRIPT_CHUNK_CHARS", 6000))   # per analysis request
 CHUNK_SPACING_SECONDS = int(os.getenv("CHUNK_SPACING_SECONDS", 15))      # pause between chunk requests
 MAX_STORED_ITEMS_PER_CALL = 25
-
 EMBEDDING_DIMS = 768
 
 # ---------------------------------------------------------------------------
@@ -113,7 +112,6 @@ SYSTEM_PROMPT = SYSTEM_PROMPT[:MAX_SYSTEM_CHARS]
 # Clients
 # ---------------------------------------------------------------------------
 groq_client = Groq(api_key=GROQ_API_KEY)
-
 mem0_config = {
     "vector_store": {
         "provider": "qdrant",
@@ -129,7 +127,7 @@ mem0_config = {
     "llm": {
         "provider": "gemini",
         "config": {
-            "model": "gemini-3.8-flash",
+            "model": "gemini-2.0-flash",
             "api_key": GEMINI_API_KEY,
         },
     },
@@ -142,9 +140,7 @@ mem0_config = {
         },
     },
 }
-
 memory = Memory.from_config(mem0_config)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -154,7 +150,6 @@ def is_authorized(update: Update) -> bool:
         return False
     user_id = str(update.effective_user.id).strip()
     return user_id == ALLOWED_USER_ID
-
 
 def parse_memories(raw_output) -> list:
     items = []
@@ -170,25 +165,20 @@ def parse_memories(raw_output) -> list:
                 items.append(entry["memory"])
     return items
 
-
 def is_rate_limit_error(err: Exception) -> bool:
     text = str(err).lower()
     return any(k in text for k in ("413", "429", "rate_limit", "rate limit", "too large"))
-
 
 def is_too_large_error(err: Exception) -> bool:
     text = str(err).lower()
     return "413" in text or "too large" in text
 
-
 def is_temporary_error(err: Exception) -> bool:
     text = str(err)
     return any(k in text for k in ("503", "429", "UNAVAILABLE", "timeout", "timed out"))
 
-
 def strip_thinking(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL).strip()
-
 
 # ---------------------------------------------------------------------------
 # MODEL ROUTER + USAGE TRACKING
@@ -200,18 +190,20 @@ STRONG_MODEL = os.getenv("STRONG_MODEL", "openai/gpt-oss-120b")
 MEM0_DEFAULT_EXTRACTION_TOKENS = 8270    # input tokens mem0's own extraction prompt needed (from the 413 errors)
 
 TASK_TIERS = {
-    "chat_simple": "fast",
-    "chat_complex": "strong",
-    "extraction": "fast",
-    "analysis": "strong",
-    "report_daily": "fast",
-    "report_weekly": "strong",
-    "summary_combine": "fast",
-    "agent_query_plan": "fast",
-    "agent_researcher": "strong",
-    "agent_planner": "strong",
-    "agent_writer": "strong",
+    "chat_simple":  "fast",
+    "chat_complex":  "strong",
+    "extraction":  "fast",
+    "analysis":  "strong",
+    "report_daily":  "fast",
+    "report_weekly":  "strong",
+    "summary_combine":  "fast",
+    "agent_query_plan":  "fast",
+    "agent_researcher":  "strong",
+    "agent_planner":  "strong",
+    "agent_writer":  "strong",
+    "agent_executive":  "strong",
 }
+
 COMPLEX_HINTS = re.compile(
     r"\b(analy[sz]e|analysis|compare|comparison|strateg\w*|plan|draft|write|rewrite|summari[sz]e|explain|"
     r"evaluate|recommend\w*|proposal|research|review|forecast|budget|negotiat\w*|optimi[sz]e|pros and cons|"
@@ -226,14 +218,12 @@ usage_state = {"dirty": False}
 USAGE_POINT_ID = 4
 USAGE_KEEP_DAYS = 30
 
-
 def classify_chat_task(user_text: str, has_search: bool = False) -> str:
     """Zero-token heuristic: quality first, so anything that looks like real work goes to the strong model."""
-    if has_search or len(user_text) > 350 or user_text.count("?") >= 2 or "```" in user_text \
+    if has_search or len(user_text) > 350 or user_text.count("?") >= 2 or "```" in user_text  \
             or COMPLEX_HINTS.search(user_text):
         return "chat_complex"
     return "chat_simple"
-
 
 def models_for(task: str, tier: str = None) -> list:
     """Models to try, in order: the right tier first, the other tier next, CHAT_MODEL last."""
@@ -248,10 +238,8 @@ def models_for(task: str, tier: str = None) -> list:
             result.append(model)
     return result or [CHAT_MODEL]
 
-
 def _num(value) -> int:
     return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
-
 
 def record_usage(task: str, model: str, prompt_tokens: int, completion_tokens: int, ok: bool = True):
     day = now_local().date().isoformat()
@@ -269,7 +257,6 @@ def record_usage(task: str, model: str, prompt_tokens: int, completion_tokens: i
     else:
         logger.warning(f"[LLM] task={task} model={model} failed")
 
-
 def llm_chat(task: str, messages: list, max_tokens: int, temperature: float = None, tier: str = None) -> str:
     """One entry point for every chat call: routing, usage counting, fallback to another model."""
     last_error = None
@@ -283,7 +270,7 @@ def llm_chat(task: str, messages: list, max_tokens: int, temperature: float = No
             except Exception as e:
                 last_error = e
                 record_usage(task, model, 0, 0, ok=False)
-                break                                   # try the next model (it has its own rate limit)
+                break                                    # try the next model (it has its own rate limit)
             usage = getattr(response, "usage", None)
             record_usage(task, model, _num(getattr(usage, "prompt_tokens", 0)), _num(getattr(usage, "completion_tokens", 0)))
             choice = response.choices[0]
@@ -294,7 +281,6 @@ def llm_chat(task: str, messages: list, max_tokens: int, temperature: float = No
                 continue                                # reasoning used the whole budget: retry with more room
             break
     raise last_error or RuntimeError("The model returned an empty answer")
-
 
 def startup_model_check():
     """Read the model list once so a wrong model name is skipped instead of failing every call."""
@@ -310,17 +296,15 @@ def startup_model_check():
             logger.warning(f"[Router] {label}={model} is not available to this Groq key and will be skipped.")
     logger.info(f"[Router] enabled={ROUTER_ENABLED} fast={FAST_MODEL} strong={STRONG_MODEL} fallback={CHAT_MODEL}")
 
-
 def save_usage() -> bool:
     with usage_lock:
         days = sorted(usage_data)[-USAGE_KEEP_DAYS:]
         snapshot = {d: {k: dict(v) for k, v in usage_data[d].items()} for d in days}
         usage_state["dirty"] = False
-    ok = save_point(USAGE_POINT_ID, {"days": snapshot})
-    if not ok:
-        usage_state["dirty"] = True
-    return ok
-
+        ok = save_point(USAGE_POINT_ID, {"days": snapshot})
+        if not ok:
+            usage_state["dirty"] = True
+        return ok
 
 def load_usage():
     days = load_point(USAGE_POINT_ID).get("days")
@@ -330,7 +314,6 @@ def load_usage():
         for day, entries in days.items():
             if isinstance(entries, dict):
                 usage_data[day] = {k: {f: _num(n) for f, n in v.items()} for k, v in entries.items() if isinstance(v, dict)}
-
 
 def aggregate_usage(days: list):
     by_model, by_task = {}, {}
@@ -343,7 +326,6 @@ def aggregate_usage(days: list):
                     for field in agg:
                         agg[field] += e.get(field, 0)
     return by_model, by_task
-
 
 def format_usage() -> str:
     today = now_local().date()
@@ -364,7 +346,6 @@ def format_usage() -> str:
             lines.append(f"- {model}: {e['calls']} {noun}, {e['in']:,} in / {e['out']:,} out tokens{failed}")
         if title == "Last 7 days":
             week_models, week_tasks = by_model, by_task
-
     total_calls = sum(e["calls"] for e in week_models.values())
     total_tokens = sum(e["in"] + e["out"] for e in week_models.values())
     if total_calls and ROUTER_ENABLED:
@@ -387,7 +368,6 @@ def format_usage() -> str:
                          f"versus about {MEM0_DEFAULT_EXTRACTION_TOKENS:,} with mem0's default prompt ({saved}% fewer).")
     return "\n".join(lines)
 
-
 EXTRACTION_PROMPT = (
     "Extract lasting facts worth remembering about the user from their message: "
     "personal details, preferences, goals, people, projects, schedules, decisions. "
@@ -395,7 +375,6 @@ EXTRACTION_PROMPT = (
     "Reply with ONLY a JSON array of short, self-contained strings, e.g. "
     '["User runs a clothing business in Jaipur"]. If nothing is worth remembering, reply [].'
 )
-
 
 def extract_facts(text: str) -> list:
     """Tiny extraction call (a few hundred tokens) instead of mem0's ~8,000-token prompt."""
@@ -415,16 +394,13 @@ def extract_facts(text: str) -> list:
     facts = [str(x).strip() for x in data if isinstance(x, str) and x.strip()]
     return facts[:5]
 
-
 def build_memory_context(memories: list) -> str:
     """Cap how many facts (and how long) go into the prompt."""
     trimmed = [m[:MAX_MEMORY_ITEM_CHARS] for m in memories[:MAX_MEMORY_ITEMS]]
     return "\n- " + "\n- ".join(trimmed) if trimmed else ""
 
-
 def call_chat(messages: list, task: str = "chat_complex") -> str:
     return llm_chat(task, messages, max_tokens=CHAT_MAX_OUTPUT_TOKENS)
-
 
 def chat_with_fallback(messages_payload: list, user_text: str, task: str = "chat_complex") -> str:
     """Normal call; on a rate-limit error wait and retry with a minimal prompt."""
@@ -434,25 +410,22 @@ def chat_with_fallback(messages_payload: list, user_text: str, task: str = "chat
         if not is_rate_limit_error(e):
             return f"Processing error: {e}"
         logger.warning(f"[Chat] Rate limit hit, retrying with a minimal prompt: {e}")
-
-    time.sleep(8)
-    minimal = [
-        {"role": "system", "content": SYSTEM_PROMPT[:1500]},
-        {"role": "user", "content": user_text[:MAX_USER_CHARS]},
-    ]
-    try:
-        return call_chat(minimal, task)
-    except Exception as e:
-        logger.error(f"[Chat] Still rate limited: {e}")
-        return "I'm briefly rate limited by my AI provider. Please send that again in about a minute."
-
+        time.sleep(8)
+        minimal = [
+            {"role": "system", "content": SYSTEM_PROMPT[:1500]},
+            {"role": "user", "content": user_text[:MAX_USER_CHARS]},
+        ]
+        try:
+            return call_chat(minimal, task)
+        except Exception as e:
+            logger.error(f"[Chat] Still rate limited: {e}")
+            return "I'm briefly rate limited by my AI provider. Please send that again in about a minute."
 
 async def send_long(bot, chat_id, text: str):
     """Telegram messages max out at 4096 characters, so split long replies."""
     text = text or ""
     for i in range(0, len(text), 3900):
         await bot.send_message(chat_id=chat_id, text=text[i:i + 3900])
-
 
 # ---------------------------------------------------------------------------
 # WEB SEARCH (Tavily)
@@ -467,10 +440,8 @@ SEARCH_TRIGGER = re.compile(
     re.IGNORECASE,
 )
 
-
 def wants_web_search(text: str) -> bool:
     return bool(SEARCH_TRIGGER.search(text))
-
 
 def take_search_slot() -> bool:
     """Daily cap so a busy day cannot burn through the free monthly credits."""
@@ -482,12 +453,10 @@ def take_search_slot() -> bool:
     search_counter["count"] += 1
     return True
 
-
 def tavily_search(query: str):
     """Returns (results, error). Exactly one of them is meaningful."""
     if not TAVILY_API_KEY:
         return [], "the TAVILY_API_KEY is not set"
-
     payload = {"query": query[:380], "max_results": SEARCH_MAX_RESULTS, "search_depth": "basic"}
     request = urllib.request.Request(
         "https://api.tavily.com/search",
@@ -513,13 +482,12 @@ def tavily_search(query: str):
         logger.error(f"[Search] Request failed: {type(e).__name__}: {e}")
         return [], "the search service could not be reached"
 
-
 def format_search_context(results: list) -> str:
     blocks = []
     for i, r in enumerate(results, start=1):
         title = (r.get("title") or "").strip()[:120]
         url = (r.get("url") or "").strip()
-        content = " ".join((r.get("content") or "").split())[:SEARCH_SNIPPET_CHARS]
+        content = "  ".join((r.get("content") or "").split())[:SEARCH_SNIPPET_CHARS]
         blocks.append(f"[{i}] {title} ({url})\n{content}")
     body = "\n\n".join(blocks)[:SEARCH_TOTAL_CHARS]
     return (
@@ -528,7 +496,6 @@ def format_search_context(results: list) -> str:
         "If the results do not answer the question, say so instead of guessing. "
         "Never present anything as a web result unless it appears above."
     )
-
 
 async def run_search_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
     """Search the web, then answer using the results AND the user's saved memory."""
@@ -542,20 +509,16 @@ async def run_search_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
             "Raise MAX_SEARCHES_PER_DAY in Render if you want more."
         )
         return
-
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     results, error = await asyncio.to_thread(tavily_search, query)
-
     if error or not results:
         reason = error or "no results came back"
         note = f"Note: live web search didn't work ({reason}), so this answer comes from memory and general knowledge and may be out of date."
         await process_user_text(update, context, query, search_note=note, save_memory=False)
         return
-
     await process_user_text(
         update, context, query, search_context=format_search_context(results), save_memory=False
     )
-
 
 # ---------------------------------------------------------------------------
 # AUDIO / CALL RECORDING PIPELINE
@@ -569,13 +532,11 @@ def now_local() -> datetime:
             return datetime.now(timezone(timedelta(hours=5, minutes=30)))
         return datetime.now(timezone.utc)
 
-
 def transcribe_audio(data: bytes, filename: str) -> str:
     """Groq Whisper transcription with retry on temporary / rate-limit errors."""
     kwargs = dict(file=(filename, data), model=WHISPER_MODEL, temperature=0)
     if WHISPER_LANGUAGE:
         kwargs["language"] = WHISPER_LANGUAGE
-
     for attempt in range(3):
         try:
             result = groq_client.audio.transcriptions.create(**kwargs)
@@ -589,15 +550,14 @@ def transcribe_audio(data: bytes, filename: str) -> str:
             else:
                 raise
 
-
 def chunk_text(text: str, size: int) -> list:
     """Split a long transcript into pieces <= size chars, preferring sentence boundaries."""
     text = text.strip()
     chunks = []
     while len(text) > size:
         window = text[:size]
-        cut = max(window.rfind(". "), window.rfind("? "), window.rfind("! "),
-                  window.rfind("\u0964 "), window.rfind("\n"))
+        cut = max(window.rfind("."), window.rfind("?"), window.rfind("!"),
+                  window.rfind("\u0964"), window.rfind("\n"))
         if cut < size * 0.5:      # no good boundary found: fall back to a space, then a hard cut
             cut = window.rfind(" ")
             if cut < size * 0.5:
@@ -607,7 +567,6 @@ def chunk_text(text: str, size: int) -> list:
     if text:
         chunks.append(text)
     return chunks
-
 
 def analysis_prompt(today_text: str, caption: str) -> str:
     context_line = f" The sender described it as: '{caption}'." if caption else ""
@@ -622,15 +581,13 @@ def analysis_prompt(today_text: str, caption: str) -> str:
         "Use empty lists when there is nothing. Only include what is actually said; never invent details."
     )
 
-
 def empty_analysis() -> dict:
     return {"summary": "", "commitments": [], "dates": [], "client_requirements": []}
-
 
 def parse_analysis(content: str) -> dict:
     content = strip_thinking(content)
     result = empty_analysis()
-    match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+    match = re.search(r"{.*}", content, flags=re.DOTALL)
     if not match:
         result["summary"] = content[:500]
         return result
@@ -639,7 +596,6 @@ def parse_analysis(content: str) -> dict:
     except Exception:
         result["summary"] = content[:500]
         return result
-
     result["summary"] = str(data.get("summary", "")).strip()
     for key in ("commitments", "dates", "client_requirements"):
         value = data.get(key, [])
@@ -647,7 +603,6 @@ def parse_analysis(content: str) -> dict:
             value = [value]
         result[key] = [str(x).strip() for x in value if str(x).strip()]
     return result
-
 
 def merge_analyses(parts: list) -> dict:
     merged = empty_analysis()
@@ -661,9 +616,8 @@ def merge_analyses(parts: list) -> dict:
                 if item.lower() not in seen[key]:
                     seen[key].add(item.lower())
                     merged[key].append(item)
-    merged["summary"] = " ".join(summaries)
+    merged["summary"] = "  ".join(summaries)
     return merged
-
 
 def analyze_chunk(chunk: str, caption: str, today_text: str, depth: int = 0) -> dict:
     """Analyse one transcript chunk. Retries on rate limits; splits the chunk if it is too large."""
@@ -692,7 +646,6 @@ def analyze_chunk(chunk: str, caption: str, today_text: str, depth: int = 0) -> 
                 raise
     return empty_analysis()
 
-
 def combine_summaries(summary_text: str) -> str:
     """Turn several partial summaries into one concise meeting summary."""
     try:
@@ -700,7 +653,7 @@ def combine_summaries(summary_text: str) -> str:
             "summary_combine",
             [
                 {"role": "system", "content": "Combine these partial summaries of one call into a single concise "
-                                              "meeting summary of at most 6 sentences. Reply with the summary only."},
+                 "meeting summary of at most 6 sentences. Reply with the summary only."},
                 {"role": "user", "content": summary_text[:6000]},
             ],
             max_tokens=800,
@@ -711,7 +664,6 @@ def combine_summaries(summary_text: str) -> str:
         logger.warning(f"[Audio] Could not combine summaries: {e}")
         return summary_text[:1500]
 
-
 def analyze_transcript(transcript: str, caption: str) -> dict:
     today_text = now_local().strftime("%A, %d %B %Y")
     chunks = chunk_text(transcript[:MAX_TRANSCRIPT_CHARS], TRANSCRIPT_CHUNK_CHARS)
@@ -720,19 +672,16 @@ def analyze_transcript(transcript: str, caption: str) -> dict:
         if i:
             time.sleep(CHUNK_SPACING_SECONDS)
         parts.append(analyze_chunk(chunk, caption, today_text))
-
     merged = merge_analyses(parts)
     if len(parts) > 1:
         time.sleep(CHUNK_SPACING_SECONDS)
         merged["summary"] = combine_summaries(merged["summary"])
     return merged
 
-
 def store_call_memories(user_id: str, analysis: dict, caption: str) -> int:
     """Save the summary, commitments, dates and requirements as persistent memories."""
     day = now_local().strftime("%Y-%m-%d")
     label = f"Call/voice note {day}" + (f" ({caption[:40]})" if caption else "")
-
     facts = []
     if analysis["summary"]:
         facts.append(f"{label} - Summary: {analysis['summary'][:600]}")
@@ -743,12 +692,10 @@ def store_call_memories(user_id: str, analysis: dict, caption: str) -> int:
     for r in analysis["client_requirements"]:
         facts.append(f"{label} - Client requirement: {r[:300]}")
     facts = facts[:MAX_STORED_ITEMS_PER_CALL]
-
     try:
         existing = {m.strip().lower() for m in parse_memories(memory.get_all(filters={"user_id": user_id}))}
     except Exception:
         existing = set()
-
     stored = 0
     for fact in facts:
         if fact.strip().lower() in existing:
@@ -766,7 +713,6 @@ def store_call_memories(user_id: str, analysis: dict, caption: str) -> int:
                     break
     return stored
 
-
 def format_audio_reply(analysis: dict, stored: int) -> str:
     lines = ["Summary:", analysis["summary"] or "(no summary produced)"]
     sections = (
@@ -782,7 +728,6 @@ def format_audio_reply(analysis: dict, stored: int) -> str:
     lines.append("")
     lines.append(f"Saved {stored} item(s) to long-term memory.")
     return "\n".join(lines)
-
 
 async def process_voice_command(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, filename: str):
     """Short voice note: transcribe it, show the text, then answer it like a typed message."""
@@ -805,13 +750,11 @@ async def process_voice_command(update: Update, context: ContextTypes.DEFAULT_TY
             msg = f"Sorry, I couldn't process that voice note: {e}"
         await bot.send_message(chat_id=chat_id, text=msg[:3500])
 
-
 async def process_audio(bot, chat_id, user_id, file_id, filename, caption):
     """Runs in the background so the bot stays responsive during long recordings."""
     try:
         tg_file = await bot.get_file(file_id)
         data = bytes(await tg_file.download_as_bytearray())
-
         def pipeline():
             with audio_lock:
                 transcript = transcribe_audio(data, filename)
@@ -820,27 +763,21 @@ async def process_audio(bot, chat_id, user_id, file_id, filename, caption):
                 analysis = analyze_transcript(transcript, caption)
                 stored = store_call_memories(user_id, analysis, caption)
                 return transcript, analysis, stored
-
         transcript, analysis, stored = await asyncio.to_thread(pipeline)
-
         if transcript is None:
             await bot.send_message(chat_id=chat_id, text="I couldn't detect any speech in that recording.")
             return
-
         reply = format_audio_reply(analysis, stored)
         await send_long(bot, chat_id, reply)
-
         if SEND_TRANSCRIPT_FILE:
             buffer = io.BytesIO(transcript.encode("utf-8"))
             buffer.name = "transcript.txt"
             await bot.send_document(chat_id=chat_id, document=buffer, caption="Full transcript")
-
         # Keep the summary in the chat window so follow-up questions work
         history = chat_history.setdefault(user_id, [])
         history.append({"role": "user", "content": "[I sent a voice note / call recording]"})
         history.append({"role": "assistant", "content": reply[:HISTORY_ITEM_CHARS]})
         chat_history[user_id] = history[-HISTORY_MESSAGES * 2:]
-
     except Exception as e:
         logger.error(f"[Audio] Processing failed: {e}", exc_info=True)
         if is_rate_limit_error(e):
@@ -848,7 +785,6 @@ async def process_audio(bot, chat_id, user_id, file_id, filename, caption):
         else:
             msg = f"Sorry, I couldn't process that recording: {e}"
         await bot.send_message(chat_id=chat_id, text=msg[:3500])
-
 
 # ---------------------------------------------------------------------------
 # DAILY BRIEFING + WEEKLY REPORT (own scheduler: no APScheduler / job-queue extra needed)
@@ -860,7 +796,6 @@ LABEL_SUMMARY = " - Summary:"
 ACTION_LABELS = (LABEL_COMMITMENT, LABEL_DATE, LABEL_REQUIREMENT)
 CALL_LABELS = ACTION_LABELS + (LABEL_SUMMARY,)
 
-
 def parse_created_at(value):
     if not value:
         return None
@@ -870,14 +805,12 @@ def parse_created_at(value):
     except Exception:
         return None
 
-
 def get_memory_records(user_id: str) -> list:
     """All stored memories for the user as dicts (id, memory, created_at), newest first."""
     try:
         raw = memory.get_all(filters={"user_id": user_id}, limit=500)
     except TypeError:
         raw = memory.get_all(filters={"user_id": user_id})
-
     entries = raw.get("results", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
     records = []
     for e in entries:
@@ -891,7 +824,6 @@ def get_memory_records(user_id: str) -> list:
     records.sort(key=lambda r: r["created_at"] or oldest, reverse=True)
     return records
 
-
 def record_date(record):
     """The day a memory was recorded: created_at if present, else a date written in its text."""
     if record["created_at"]:
@@ -904,17 +836,14 @@ def record_date(record):
             return None
     return None
 
-
 def item_line(record) -> str:
     d = record_date(record)
     has_date_in_text = re.search(r"\d{4}-\d{2}-\d{2}", record["memory"])
     prefix = f"[{d.isoformat()}] " if d and not has_date_in_text else ""
     return f"- {prefix}{record['memory'][:220]}"
 
-
 def has_label(record, labels) -> bool:
     return any(label in record["memory"] for label in labels)
-
 
 REPORT_INSTRUCTIONS = {
     "daily": (
@@ -938,13 +867,11 @@ REPORT_EMPTY = {
     "weekly": "No calls, commitments or deadlines were saved in the last 7 days, so there is nothing to report yet.",
 }
 
-
 def generate_report(kind: str, records: list) -> str:
     """Build the briefing/report text. Uses the LLM only when there is real data to summarise."""
     now = now_local()
     today_text = now.strftime("%A, %d %B %Y")
     title = f"{REPORT_TITLES[kind]} - {today_text}"
-
     if kind == "daily":
         items = [r for r in records if has_label(r, ACTION_LABELS)][:30]
         extra = [r for r in records if not has_label(r, CALL_LABELS)][:5]
@@ -955,16 +882,13 @@ def generate_report(kind: str, records: list) -> str:
         upcoming = [r for r in records if has_label(r, (LABEL_DATE,)) and id(r) not in recent_ids][:15]
         items = recent + upcoming
         extra = []
-
     if not items:
         return f"{title}\n\n{REPORT_EMPTY[kind]}"
-
     lines = [item_line(r) for r in items]
     background = [item_line(r) for r in extra]
     user_content = f"Today is {today_text}.\n\nSaved items:\n" + "\n".join(lines)
     if background:
         user_content += "\n\nBackground facts about your employer:\n" + "\n".join(background)
-
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT[:2000] + "\n\n" + REPORT_INSTRUCTIONS[kind]},
         {"role": "user", "content": user_content},
@@ -982,16 +906,13 @@ def generate_report(kind: str, records: list) -> str:
             else:
                 logger.error(f"[Report] AI summary failed: {e}")
                 break
-
     # AI unavailable: still deliver the raw saved items so the report is never empty
     return f"{title}\n\n(AI summary unavailable right now. Here are your saved items.)\n" + "\n".join(lines)
-
 
 async def deliver_report(bot, chat_id, user_id: str, kind: str, prefix: str = ""):
     records = await asyncio.to_thread(get_memory_records, user_id)
     text = await asyncio.to_thread(generate_report, kind, records)
     await send_long(bot, chat_id, prefix + text)
-
 
 # ----- Editable schedule (change it by chatting; saved in Qdrant so it survives restarts) -----
 WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -1000,9 +921,9 @@ WEEKDAY_LOOKUP = {
     "thursday": 3, "thu": 3, "thur": 3, "thurs": 3, "friday": 4, "fri": 4,
     "saturday": 5, "sat": 5, "sunday": 6, "sun": 6,
 }
+
 SETTINGS_COLLECTION = "ai_employee_settings"
 SETTINGS_POINT_ID = 1
-
 
 def default_schedule() -> dict:
     return {
@@ -1011,11 +932,9 @@ def default_schedule() -> dict:
                    "hour": WEEKLY_REPORT_HOUR, "minute": WEEKLY_REPORT_MINUTE},
     }
 
-
 schedule = default_schedule()
 last_run = {}          # kind -> date string of the last delivery
 _qdrant_client = None
-
 
 def get_qdrant():
     global _qdrant_client
@@ -1023,7 +942,6 @@ def get_qdrant():
         from qdrant_client import QdrantClient
         _qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
     return _qdrant_client
-
 
 def load_schedule():
     """Load the saved schedule from Qdrant (falls back to the defaults if unavailable)."""
@@ -1042,7 +960,6 @@ def load_schedule():
     except Exception as e:
         logger.warning(f"[Scheduler] Could not load saved schedule, using defaults: {e}")
 
-
 def save_schedule():
     try:
         from qdrant_client.models import PointStruct
@@ -1055,11 +972,10 @@ def save_schedule():
         logger.error(f"[Scheduler] Could not save schedule: {e}")
         return False
 
-
 STATE_POINT_ID = 2          # holds {"last_run": {...}}
 REMINDERS_POINT_ID = 3      # holds {"next_id": n, "items": [...]}
-settings_collection_ready = False
 
+settings_collection_ready = False
 
 def ensure_settings_collection():
     """Create the small settings collection once (it also stores the schedule and reminders)."""
@@ -1076,7 +992,6 @@ def ensure_settings_collection():
         )
     settings_collection_ready = True
 
-
 def load_point(point_id: int) -> dict:
     try:
         ensure_settings_collection()
@@ -1086,7 +1001,6 @@ def load_point(point_id: int) -> dict:
     except Exception as e:
         logger.warning(f"[Settings] Could not load point {point_id}: {e}")
     return {}
-
 
 def save_point(point_id: int, payload: dict) -> bool:
     try:
@@ -1101,16 +1015,13 @@ def save_point(point_id: int, payload: dict) -> bool:
         logger.error(f"[Settings] Could not save point {point_id}: {e}")
         return False
 
-
 def save_state() -> bool:
     """Remember which reports were already sent today, so a restart never skips or repeats one."""
     return save_point(STATE_POINT_ID, {"last_run": dict(last_run)})
 
-
 def parse_iso(value: str) -> datetime:
     dt = datetime.fromisoformat(value)
     return dt if dt.tzinfo else dt.replace(tzinfo=now_local().tzinfo)
-
 
 def load_state_and_reminders():
     """Called once at startup."""
@@ -1119,7 +1030,6 @@ def load_state_and_reminders():
         for kind in ("daily", "weekly"):
             if isinstance(saved.get(kind), str):
                 last_run[kind] = saved[kind]
-
     data = load_point(REMINDERS_POINT_ID)
     clean = []
     for item in data.get("items", []) if isinstance(data.get("items"), list) else []:
@@ -1135,7 +1045,6 @@ def load_state_and_reminders():
     reminders["next_id"] = max(int(data.get("next_id", 1) or 1), max([i["id"] for i in clean], default=0) + 1)
     logger.info(f"[Startup] Loaded {len(clean)} reminder(s); last_run={last_run}")
 
-
 def reset_last_run_after_change(kind: str):
     """After the user moves a time: don't fire instantly for a time already past today."""
     now = now_local()
@@ -1147,15 +1056,12 @@ def reset_last_run_after_change(kind: str):
     else:
         last_run.pop(kind, None)
 
-
 def tz_label() -> str:
     return "IST" if TIMEZONE_NAME == "Asia/Kolkata" else TIMEZONE_NAME
-
 
 def fmt_time(hour: int, minute: int) -> str:
     suffix = "AM" if hour < 12 else "PM"
     return f"{(hour % 12) or 12}:{minute:02d} {suffix}"
-
 
 def format_schedule() -> str:
     d, w = schedule["daily"], schedule["weekly"]
@@ -1169,7 +1075,6 @@ def format_schedule() -> str:
         "\"send the weekly report on Monday at 5 PM\", or \"turn off the briefing\"."
     )
 
-
 OFF_WORDS = ("turn off", "switch off", "disable", "stop sending", "stop the", "stop my", "pause",
              "cancel", "no more", "don't send", "dont send", "do not send")
 ON_WORDS = ("turn on", "switch on", "enable", "resume", "restart", "start sending")
@@ -1177,14 +1082,12 @@ CHANGE_WORDS = ("change", "set ", "move", "shift", "update", "reschedule", "swit
 SEND_WORDS = ("send", "schedule", "deliver", "remind")
 SHOW_WORDS = ("what time", "when do", "when is", "when will", "show schedule", "my schedule", "show my schedule")
 
-
 def parse_time_of_day(t: str, kind: str):
     """Return (hour, minute, assumed) from text, None if no time, or 'invalid'."""
     if "noon" in t:
         return 12, 0, False
     if "midnight" in t:
         return 0, 0, False
-
     m = re.search(r"(\d{1,2}):(\d{2})\s*(a\.?m\.?|p\.?m\.?)?", t)
     if m:
         hour, minute, meridiem = int(m.group(1)), int(m.group(2)), m.group(3)
@@ -1197,7 +1100,6 @@ def parse_time_of_day(t: str, kind: str):
             if not m:
                 return None
             hour, minute, meridiem = int(m.group(1)), 0, None
-
     if minute > 59:
         return "invalid"
     assumed = False
@@ -1213,11 +1115,9 @@ def parse_time_of_day(t: str, kind: str):
         return "invalid"
     return hour, minute, assumed
 
-
 def parse_schedule_request(text: str):
     """Understand 'move my briefing to 8:30 AM' style messages. Returns a dict, or None for normal chat."""
     t = " " + text.lower().strip() + " "
-
     kinds = set()
     if "weekly" in t or ("week" in t and "report" in t):
         kinds.add("weekly")
@@ -1232,19 +1132,15 @@ def parse_schedule_request(text: str):
             return {"action": "ambiguous"}
         return None
     kind = kinds.pop()
-
     time_result = parse_time_of_day(t, kind)
     weekday_match = re.search(r"\b(" + "|".join(sorted(WEEKDAY_LOOKUP, key=len, reverse=True)) + r")\b", t)
     weekday = WEEKDAY_LOOKUP[weekday_match.group(1)] if (weekday_match and kind == "weekly") else None
     has_change_word = any(w in t for w in CHANGE_WORDS)
     has_send_word = any(w in t for w in SEND_WORDS)
-
     if any(w in t for w in OFF_WORDS):
         return {"action": "off", "kind": kind}
-
     if time_result == "invalid":
         return {"action": "invalid", "kind": kind}
-
     if (time_result is not None and (has_change_word or has_send_word or " at " in t or " to " in t)) or \
             (weekday is not None and has_change_word):
         change = {"action": "set", "kind": kind}
@@ -1253,14 +1149,11 @@ def parse_schedule_request(text: str):
         if weekday is not None:
             change["weekday"] = weekday
         return change
-
     if any(w in t for w in ON_WORDS):
         return {"action": "on", "kind": kind}
-
     if any(w in t for w in SHOW_WORDS):
         return {"action": "show", "kind": kind}
     return None
-
 
 async def apply_schedule_change(change: dict) -> str:
     action = change["action"]
@@ -1271,11 +1164,9 @@ async def apply_schedule_change(change: dict) -> str:
         return format_schedule()
     if action == "invalid":
         return "I couldn't understand that time. Try something like \"8:30 AM\" or \"18:00\"."
-
     kind = change["kind"]
     name = "morning briefing" if kind == "daily" else "weekly report"
     entry = schedule[kind]
-
     if action == "off":
         entry["enabled"] = False
     elif action == "on":
@@ -1287,10 +1178,8 @@ async def apply_schedule_change(change: dict) -> str:
         if "weekday" in change:
             entry["weekday"] = change["weekday"]
     reset_last_run_after_change(kind)   # a new time that is still ahead fires today; one already past waits
-
     saved = await asyncio.to_thread(save_schedule)
     await asyncio.to_thread(save_state)
-
     if not entry["enabled"]:
         reply = f"Okay, your {name} is turned off. Say \"turn on my {name}\" any time to bring it back."
     elif kind == "daily":
@@ -1304,18 +1193,15 @@ async def apply_schedule_change(change: dict) -> str:
         reply += "\n(Warning: I couldn't save this to the database, so it may reset if the bot restarts.)"
     return reply
 
-
 def due_jobs(now: datetime, last_run: dict) -> list:
     """Which scheduled reports should fire right now. Pure function so it is easy to test."""
     due = []
     today = now.date().isoformat()
     minutes_now = now.hour * 60 + now.minute
-
     d = schedule["daily"]
     daily_at = d["hour"] * 60 + d["minute"]
     if d["enabled"] and daily_at <= minutes_now < daily_at + SCHEDULE_WINDOW_MINUTES and last_run.get("daily") != today:
         due.append("daily")
-
     w = schedule["weekly"]
     weekly_at = w["hour"] * 60 + w["minute"]
     if (w["enabled"] and now.weekday() == w["weekday"]
@@ -1324,11 +1210,9 @@ def due_jobs(now: datetime, last_run: dict) -> list:
         due.append("weekly")
     return due
 
-
 def lateness_minutes(kind: str, now: datetime) -> int:
     entry = schedule[kind]
     return now.hour * 60 + now.minute - (entry["hour"] * 60 + entry["minute"])
-
 
 async def scheduler_loop(app):
     logger.info(f"[Scheduler] Started.\n{format_schedule().splitlines()[0]}\n{format_schedule().splitlines()[1]}")
@@ -1349,7 +1233,7 @@ async def scheduler_loop(app):
                         await deliver_report(app.bot, int(ALLOWED_USER_ID), ALLOWED_USER_ID, kind, prefix)
                         last_run[kind] = today
                         await asyncio.to_thread(save_state)
-                    except asyncio.CancelledError:
+                    except asyncio.CancelledError: 
                         raise
                     except Exception as e:
                         logger.error(f"[Scheduler] {kind} report failed: {e}", exc_info=True)
@@ -1365,7 +1249,6 @@ async def scheduler_loop(app):
         except Exception as e:
             logger.error(f"[Scheduler] Loop error: {e}", exc_info=True)
         await asyncio.sleep(30)
-
 
 # ---------------------------------------------------------------------------
 # REMINDERS: "remind me at 3 PM to call Amit". Saved in Qdrant, so they survive restarts.
@@ -1387,9 +1270,9 @@ PART_OF_DAY_DEFAULT = {"morning": (9, 0), "afternoon": (15, 0), "evening": (18, 
 
 REMIND_START = re.compile(
     r"^\s*(?:(?:hey|hi|hello|ok|okay|yo)\b[A-Za-z' ]{0,30}[,:]\s*)?"        # "Hey bot, ..."
-    r"(?:(?:hey|hi|hello|ok|okay|please|kindly|also|just|can you|could you|would you|will you)[,\s]+)*"
+    r"(?:(?:hey|hi|hello|ok|okay|please|kindly|also|just|can you|could you|would you|will you)[,\s]+)"
     r"(?:remind me|reminder\s+(?=to\b|for\b|about\b)|remind\s+(?=to\b|about\b)|"
-    r"(?:set|add|create|make)\s+(?:a\s+|an\s+)?reminder)\b[\s,:\-]*",
+    r"(?:set|add|create|make)\s+(?:a\s+|an\s+)?reminder)\b[\s,:-]",
     re.IGNORECASE,
 )
 LIST_RE = re.compile(
@@ -1400,14 +1283,12 @@ LIST_RE = re.compile(
 )
 CANCEL_RE = re.compile(r"^\s*(?:please\s+)?(?:cancel|delete|remove|clear|drop)\b.*\breminders?\b", re.IGNORECASE)
 REL_RE = re.compile(
-    r"\bin\s+(half an?|an?|\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty)\s*"
+    r"\bin\s+(half an?|an?|\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty)\s"
     r"(minutes?|mins?|hours?|hrs?|days?|weeks?)\b"
 )
 
-
 class ReminderProblem(Exception):
     """A reminder request that cannot be scheduled; the message is shown to the user."""
-
 
 def fmt_due(dt: datetime, now: datetime = None) -> str:
     now = now or now_local()
@@ -1418,7 +1299,6 @@ def fmt_due(dt: datetime, now: datetime = None) -> str:
         day = f"tomorrow, {day}"
     return f"{day} at {fmt_time(dt.hour, dt.minute)} {tz_label()}"
 
-
 def repeat_label(repeat, due: datetime) -> str:
     if repeat == "daily":
         return "every day"
@@ -1427,7 +1307,6 @@ def repeat_label(repeat, due: datetime) -> str:
     if repeat == "weekly":
         return f"every {WEEKDAY_NAMES[due.weekday()]}"
     return ""
-
 
 def next_due(due: datetime, repeat, now: datetime) -> datetime:
     nxt = due
@@ -1444,7 +1323,6 @@ def next_due(due: datetime, repeat, now: datetime) -> datetime:
             break
     return nxt
 
-
 def find_time_phrase(low: str):
     """Earliest clock time in the text: (hour, minute, meridiem or None, span) or None."""
     if (m := re.search(r"\bnoon\b", low)):
@@ -1452,7 +1330,7 @@ def find_time_phrase(low: str):
     if (m := re.search(r"\bmidnight\b", low)):
         return 12, 0, "a", m.span()
     patterns = (
-        r"(?:\bat\s+|@\s*)?\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)(?![a-z])",
+        r"(?:\bat\s+|@\s*)?\b(\d{1,2})(?::(\d{2}))?\s*(a.?m.?|p.?m.?)(?![a-z])",
         r"(?:\bat\s+)?\b(\d{1,2}):(\d{2})\b()",
         r"\bat\s+(\d{1,2})\b()()(?![:\d])(?:\s*o'?clock)?",
     )
@@ -1468,7 +1346,6 @@ def find_time_phrase(low: str):
     meridiem = best.group(3)[0] if best.group(3) else None
     return hour, minute, meridiem, best.span()
 
-
 def resolve_calendar_date(day: int, month: int, year, today: date):
     try:
         if year:
@@ -1478,7 +1355,6 @@ def resolve_calendar_date(day: int, month: int, year, today: date):
     except ValueError:
         return None
 
-
 def find_date_phrase(low: str, today: date):
     """Returns ({'kind':..., ...}, span) or (None, None). Raises ReminderProblem for impossible dates."""
     if (m := re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", low)):
@@ -1486,19 +1362,16 @@ def find_date_phrase(low: str, today: date):
         if not d:
             raise ReminderProblem("I couldn't understand that date.")
         return {"kind": "date", "date": d}, m.span()
-
     if (m := re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?({MONTH_PATTERN})\b(?:\s*,?\s*(\d{{4}}))?", low)):
         d = resolve_calendar_date(int(m.group(1)), MONTHS[m.group(2)], int(m.group(3)) if m.group(3) else None, today)
         if not d:
             raise ReminderProblem("I couldn't understand that date.")
         return {"kind": "date", "date": d}, m.span()
-
     if (m := re.search(rf"\b({MONTH_PATTERN})\s+(\d{{1,2}})(?:st|nd|rd|th)?\b(?:\s*,?\s*(\d{{4}}))?", low)):
         d = resolve_calendar_date(int(m.group(2)), MONTHS[m.group(1)], int(m.group(3)) if m.group(3) else None, today)
         if not d:
             raise ReminderProblem("I couldn't understand that date.")
         return {"kind": "date", "date": d}, m.span()
-
     if (m := re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", low)):
         day, month = int(m.group(1)), int(m.group(2))
         year = int(m.group(3)) if m.group(3) else None
@@ -1509,17 +1382,14 @@ def find_date_phrase(low: str, today: date):
         if not d:
             raise ReminderProblem("I couldn't understand that date. I read dates as day/month, like 15/10.")
         return {"kind": "date", "date": d}, m.span()
-
     if (m := re.search(r"\bday after tomorrow\b", low)):
         return {"kind": "date", "date": today + timedelta(days=2)}, m.span()
     if (m := re.search(r"\btomorrow\b", low)):
         return {"kind": "date", "date": today + timedelta(days=1)}, m.span()
     if (m := re.search(r"\b(?:today|tonight)\b", low)):
         return {"kind": "today"}, m.span()
-
     if (m := re.search(rf"\b(?:on\s+)?(?:(next|this)\s+)?({WEEKDAY_PATTERN})\b", low)):
         return {"kind": "weekday", "weekday": WEEKDAY_LOOKUP[m.group(2)], "next": m.group(1) == "next"}, m.span()
-
     if (m := re.search(r"\b(?:on\s+)?(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)\b", low)):
         day = int(m.group(1))
         for offset in range(0, 4):
@@ -1534,15 +1404,12 @@ def find_date_phrase(low: str, today: date):
         raise ReminderProblem("I couldn't understand that date.")
     return None, None
 
-
 def compute_due(now: datetime, date_info, time_info, partofday, repeat):
     """Decide the exact moment. Returns (due, notes). Raises ReminderProblem or LookupError('need_time')."""
     notes = []
     today, tz = now.date(), now.tzinfo
-
     def at(d, hm):
         return datetime(d.year, d.month, d.day, hm[0], hm[1], tzinfo=tz)
-
     ambiguous = False
     if time_info:
         hour, minute, meridiem = time_info
@@ -1572,7 +1439,6 @@ def compute_due(now: datetime, date_info, time_info, partofday, repeat):
         notes.append("You didn't give a time, so I used 9:00 AM.")
     else:
         raise LookupError("need_time")
-
     if date_info is None:                              # time only: the next time that clock hits
         options = []
         for hm in candidates:
@@ -1584,7 +1450,6 @@ def compute_due(now: datetime, date_info, time_info, partofday, repeat):
         if ambiguous:
             notes.append(f"I read it as {fmt_time(*chosen)}, the next time the clock hits that. Say AM or PM to be exact.")
         return due, notes
-
     kind = date_info["kind"]
     if ambiguous:
         if kind == "today":
@@ -1598,7 +1463,6 @@ def compute_due(now: datetime, date_info, time_info, partofday, repeat):
         notes.append(f"I read it as {fmt_time(*chosen)}. Say AM or PM to be exact.")
     else:
         chosen = candidates[0]
-
     if kind == "today":
         d = today
     elif kind == "date":
@@ -1609,20 +1473,18 @@ def compute_due(now: datetime, date_info, time_info, partofday, repeat):
             if d.weekday() == date_info["weekday"] and at(d, chosen) > now and not (date_info["next"] and d == today):
                 break
             d += timedelta(days=1)
-
     due = at(d, chosen)
     if due <= now:
         raise ReminderProblem("That time has already passed today. Tell me a later time or add a date."
                               if d == today else "That date and time is in the past.")
     return due, notes
 
-
 def extract_reminder_text(rest: str, spans: list) -> str:
     chars = list(rest)
     for start, end in spans:
         for i in range(start, end):
             chars[i] = " "
-    masked = "".join(chars)
+    masked = " ".join(chars)
     # "to/about/that" only introduces the reminder text when it comes first (after any leftover time words);
     # a "to" inside the text itself ("go to Jaipur") must stay.
     m = re.match(r"\s*(?:(?:on|at|by|in|for)\s+)*(?:to|about|that)\b\s+", masked.lower())
@@ -1631,24 +1493,20 @@ def extract_reminder_text(rest: str, spans: list) -> str:
     previous = None
     while previous != text:
         previous = text
-        text = re.sub(r"^(?:on|at|by|in|for|to|about|that)\s+", "", text, flags=re.IGNORECASE).strip(" ,.;:-?!")
-        text = re.sub(r"\s+(?:on|at|by|in|for|to)$", "", text, flags=re.IGNORECASE).strip(" ,.;:-?!")
+        text = re.sub(r"^(?:on|at|by|in|for|to|about|that)\s+", " ", text, flags=re.IGNORECASE).strip(" ,.;:-?!")
+        text = re.sub(r"\s+(?:on|at|by|in|for|to)$", " ", text, flags=re.IGNORECASE).strip(" ,.;:-?!")
     return text[:1].upper() + text[1:] if text else ""
-
 
 def parse_new_reminder(rest: str, now: datetime) -> dict:
     low = rest.lower()
     masked = list(low)
     spans = []
-
     def mask(span):
         spans.append(span)
         for i in range(span[0], span[1]):
             masked[i] = " "
-
     def cur():
         return "".join(masked)
-
     try:
         # repeat
         repeat, repeat_weekday = None, None
@@ -1660,7 +1518,6 @@ def parse_new_reminder(rest: str, now: datetime) -> dict:
             repeat = "daily"; mask(m.span())
         elif (m := re.search(r"\bevery\s+week\b|^\s*weekly\b|\bweekly\s+(?=at\b|\d)", cur())):
             repeat = "weekly"; mask(m.span())
-
         # relative ("in 30 minutes", "in 2 days")
         rel_due, date_info = None, None
         if (m := REL_RE.search(cur())):
@@ -1676,7 +1533,6 @@ def parse_new_reminder(rest: str, now: datetime) -> dict:
             else:
                 days = int(qty * (7 if unit.startswith("w") else 1))
                 date_info = {"kind": "date", "date": now.date() + timedelta(days=days)}
-
         if rel_due is not None:
             due = rel_due.replace(second=0, microsecond=0)
             notes = []
@@ -1688,7 +1544,6 @@ def parse_new_reminder(rest: str, now: datetime) -> dict:
                 partofday, date_info = m.group(1), {"kind": "today"}; mask(m.span())
             elif (m := re.search(r"\btonight\b", cur())):
                 partofday, date_info = "tonight", {"kind": "today"}; mask(m.span())
-
             if date_info is None:
                 date_info, span = find_date_phrase(cur(), now.date())
                 if span:
@@ -1698,32 +1553,26 @@ def parse_new_reminder(rest: str, now: datetime) -> dict:
                         partofday = pm.group(1); mask((span[1], pm.end()))
             if partofday is None and (m := re.search(r"\bin\s+the\s+(morning|afternoon|evening)\b", cur())):
                 partofday = m.group(1); mask(m.span())
-
             if repeat == "weekly" and repeat_weekday is not None and date_info is None:
                 date_info = {"kind": "weekday", "weekday": repeat_weekday, "next": False}
-
             time_found = find_time_phrase(cur())
             time_info = None
             if time_found:
                 time_info = time_found[:3]
                 mask(time_found[3])
-
             try:
                 due, notes = compute_due(now, date_info, time_info, partofday, repeat)
             except LookupError:
                 return {"action": "need_time"}
     except ReminderProblem as e:
         return {"action": "error", "message": str(e)}
-
     if repeat == "weekdays":
         while due.weekday() >= 5:
             due += timedelta(days=1)
-
     text = extract_reminder_text(rest, spans)
     if not text:
         return {"action": "need_text"}
     return {"action": "add", "text": text[:300], "due": due, "repeat": repeat, "notes": notes}
-
 
 def parse_reminder_request(text: str, now: datetime = None):
     """Returns a dict for reminder requests (add / list / cancel), or None for ordinary messages."""
@@ -1736,20 +1585,17 @@ def parse_reminder_request(text: str, now: datetime = None):
         low = t.lower()
         if re.search(r"\ball\b", low):
             return {"action": "cancel_all"}
-        idm = re.search(r"(?:#|\bnumber\s+|\bno\.?\s*|\breminders?\s+)(\d+)", low) or re.search(r"\b(\d+)\b", low)
+        idm = re.search(r"(?:#|\bnumber\s+|\bno.?\s*|\breminders?\s+)(\d+)", low) or re.search(r"\b(\d+)\b", low)
         return {"action": "cancel", "id": int(idm.group(1))} if idm else {"action": "cancel_none"}
     if LIST_RE.match(t):
         return {"action": "list"}
     return None
 
-
 def reminder_snapshot() -> dict:
     return {"next_id": reminders["next_id"], "items": [dict(i) for i in reminders["items"]]}
 
-
 def save_reminders(snapshot: dict) -> bool:
     return save_point(REMINDERS_POINT_ID, snapshot)
-
 
 def format_reminders() -> str:
     items = sorted(reminders["items"], key=lambda r: parse_iso(r["due"]))
@@ -1762,7 +1608,6 @@ def format_reminders() -> str:
         extra = f" (repeats {repeat_label(r.get('repeat'), due)})" if r.get("repeat") else ""
         lines.append(f"#{r['id']} - {fmt_due(due, now)} - {r['text']}{extra}")
     return "Your reminders:\n" + "\n".join(lines) + "\n\nCancel one with \"cancel reminder 3\" or all with \"cancel all reminders\"."
-
 
 async def apply_reminder_request(change: dict) -> str:
     action = change["action"]
@@ -1777,7 +1622,6 @@ async def apply_reminder_request(change: dict) -> str:
         return format_reminders()
     if action == "cancel_none":
         return "Which reminder? Say \"cancel reminder 3\" using a number from your list.\n\n" + format_reminders()
-
     async with reminders_lock:
         if action == "cancel_all":
             count = len(reminders["items"])
@@ -1802,11 +1646,9 @@ async def apply_reminder_request(change: dict) -> str:
                 reply += f" Repeats {repeat_label(change['repeat'], change['due'])}."
             for note in change["notes"]:
                 reply += f" ({note})"
-
     if not saved:
         reply += "\n(Warning: I couldn't save this to the database, so it may be lost if the bot restarts.)"
     return reply
-
 
 async def fire_due_reminders(bot, now: datetime):
     """Send every reminder that is due. Reminders missed during downtime are sent late, never lost."""
@@ -1824,12 +1666,11 @@ async def fire_due_reminders(bot, now: datetime):
                         item["due"] = next_due(due_dt, item["repeat"], now).isoformat()
                     else:
                         reminders["items"].remove(item)
-                    await asyncio.to_thread(save_reminders, reminder_snapshot())
+            await asyncio.to_thread(save_reminders, reminder_snapshot())
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.error(f"[Reminders] Could not deliver reminder #{item.get('id')}: {e}", exc_info=True)
-
 
 # ---------------------------------------------------------------------------
 # SUB-AGENTS: the main assistant hands specialised work to focused workers.
@@ -1839,7 +1680,8 @@ async def fire_due_reminders(bot, now: datetime):
 ENABLE_AGENTS = os.getenv("ENABLE_AGENTS", "true").lower() == "true"
 AGENT_MAX_WORKERS = int(os.getenv("AGENT_MAX_WORKERS", 3))   # a request never spawns more workers than this
 AGENT_PRIOR_CHARS = 4000                                     # how much earlier worker output the next worker sees
-WORKER_LABELS = {"researcher": "Researcher", "planner": "Planner", "writer": "Writer"}
+
+WORKER_LABELS = {"researcher": "Researcher", "planner": "Planner", "writer": "Writer", "executive": "Executive"}
 
 RESEARCH_RE = re.compile(
     r"\b(research|investigate|look into|find out (?:about|more)|background (?:on|of)|competitors?|"
@@ -1854,6 +1696,12 @@ PLAN_RE = re.compile(
 WRITE_RE = re.compile(
     r"\b(draft|write|compose|prepare|put together)\b[^.?!\n]{0,60}\b(e-?mail|mail|message|reply|response|proposal|"
     r"follow[- ]?up|letter|whatsapp|text|note|pitch|quotation|quote|announcement|post|caption|report|summary)\b",
+    re.IGNORECASE,
+)
+EXECUTIVE_RE = re.compile(
+    r"\b(my (?:calendar|schedule|agenda|inbox|emails?)|what'?s? (?:on|next|up) (?:today|this week|tomorrow)|"
+    r"upcoming (?:meetings?|events?|calls?)|check (?:my )?(?:calendar|gmail|inbox|mail)|"
+    r"schedule (?:a )?(?:meeting|call|appointment)|book (?:a )?(?:meeting|call))\b",
     re.IGNORECASE,
 )
 
@@ -1876,12 +1724,21 @@ WRITER_PROMPT = (
     "use them. Output the draft first, then a final line starting with 'Assumptions:' listing anything you assumed "
     "(leave that line out if you assumed nothing). Plain text."
 )
+EXECUTIVE_PROMPT = (
+    "You are the Executive, a specialist worker for the user's AI assistant. "
+    "You have live access to their Google Calendar and Gmail. Use ONLY the live data "
+    "provided below. Never invent events, emails, times or people. Be concise: "
+    "lead with what matters most (next 24h, unread urgent emails). Plain text, no markdown. "
+    "If the user asked to create an event and you have the data, output a JSON block "
+    "on its own line: {\"create_event\": {\"summary\": \"...\", \"start\": \"<RFC3339>\", "
+    "\"end\": \"<RFC3339>\"}}. Otherwise just answer in plain text."
+)
+
 QUERY_PLAN_PROMPT = (
     "Turn the request into at most 3 short, distinct web search queries that would help research it. Use only the "
     "topic itself (a company, product or market). Never include personal details about the user, phone numbers or "
     "email addresses. Reply with ONLY a JSON array of strings."
 )
-
 
 def plan_delegation(text: str) -> list:
     """Which workers should handle this message, in order. An empty list means normal chat."""
@@ -1894,8 +1751,9 @@ def plan_delegation(text: str) -> list:
         workers.append("planner")
     if WRITE_RE.search(text):
         workers.append("writer")
+    if EXECUTIVE_RE.search(text):
+        workers.append("executive")
     return workers[:AGENT_MAX_WORKERS]
-
 
 def worker_facts(user_id: str, text: str) -> list:
     try:
@@ -1904,12 +1762,10 @@ def worker_facts(user_id: str, text: str) -> list:
         logger.warning(f"[Agents] Memory lookup failed: {e}")
         return []
 
-
 def facts_block(facts: list) -> str:
     if not facts:
         return ""
     return "\n\nKnown facts about your employer:\n" + "\n".join(f"- {f[:MAX_MEMORY_ITEM_CHARS]}" for f in facts)
-
 
 def plan_queries(request: str) -> list:
     try:
@@ -1923,22 +1779,19 @@ def plan_queries(request: str) -> list:
         logger.warning(f"[Agents] Query planning failed, using the request itself: {e}")
     return [request[:200]]
 
-
 def numbered_results(results: list) -> str:
     blocks = []
     for i, r in enumerate(results, start=1):
         title = (r.get("title") or "").strip()[:120]
-        content = " ".join((r.get("content") or "").split())[:SEARCH_SNIPPET_CHARS]
+        content = "  ".join((r.get("content") or "").split())[:SEARCH_SNIPPET_CHARS]
         blocks.append(f"[{i}] {title}\n{content}")
     return "\n\n".join(blocks)[:SEARCH_TOTAL_CHARS]
-
 
 def sources_block(results: list) -> str:
     if not results:
         return ""
     return "Sources:\n" + "\n".join(
         f"[{i}] {(r.get('title') or '').strip()[:80]} - {(r.get('url') or '').strip()}" for i, r in enumerate(results, start=1))
-
 
 def run_researcher(user_id: str, request: str, prior: str) -> dict:
     notes, results, seen = [], [], set()
@@ -1959,12 +1812,10 @@ def run_researcher(user_id: str, request: str, prior: str) -> dict:
                     seen.add(url)
                     results.append(r)
         results = results[:6]
-
     facts = worker_facts(user_id, request)
     if not results and not facts:
         return {"ok": True, "text": "I couldn't find anything useful on that. Try adding the company or product name.",
                 "sources": "", "notes": notes}
-
     user_content = f"Request: {request}\n\n" + (
         f"Web results:\n{numbered_results(results)}" if results else "No web results are available.")
     text = llm_chat(
@@ -1975,7 +1826,6 @@ def run_researcher(user_id: str, request: str, prior: str) -> dict:
     )
     return {"ok": True, "text": text, "sources": sources_block(results), "notes": notes}
 
-
 def run_planner(user_id: str, request: str, prior: str) -> dict:
     records = get_memory_records(user_id)
     items = [r for r in records if has_label(r, ACTION_LABELS)][:30]
@@ -1984,7 +1834,6 @@ def run_planner(user_id: str, request: str, prior: str) -> dict:
         return {"ok": True, "sources": "", "notes": [],
                 "text": "I don't have any saved commitments, deadlines or reminders yet, so there is nothing to prioritise. "
                         "Tell me what is on your plate or send a call recording."}
-
     now = now_local()
     content = f"Today is {now.strftime('%A, %d %B %Y')}.\n\nRequest: {request}\n\nSaved items:\n"
     content += "\n".join(item_line(r) for r in items) if items else "(none)"
@@ -1997,7 +1846,6 @@ def run_planner(user_id: str, request: str, prior: str) -> dict:
         max_tokens=1000,
     )
     return {"ok": True, "text": text, "sources": "", "notes": []}
-
 
 def run_writer(user_id: str, request: str, prior: str) -> dict:
     facts = worker_facts(user_id, request)
@@ -2012,9 +1860,57 @@ def run_writer(user_id: str, request: str, prior: str) -> dict:
     )
     return {"ok": True, "text": text, "sources": "", "notes": []}
 
+def run_executive(user_id: str, request: str, prior: str) -> dict:
+    notes, text = [], ""
+    try:
+        from google_tools import (
+            is_google_configured, get_upcoming_events, get_recent_emails
+        )
+    except ImportError as e:
+        return {"ok": False, "text": "", "sources": "",
+                "notes": [f"Google integration unavailable ({e})."]}
 
-WORKER_FUNCS = {"researcher": run_researcher, "planner": run_planner, "writer": run_writer}
+    if not is_google_configured():
+        return {"ok": False, "text": "", "sources": "",
+                "notes": ["Google isn't connected. Run auth_google.py and set GOOGLE_TOKEN_JSON."]}
 
+    wants_calendar = bool(re.search(r"calendar|schedule|agenda|meeting|event|upcoming", request, re.I))
+    wants_email    = bool(re.search(r"email|inbox|gmail|mail", request, re.I))
+    if not (wants_calendar or wants_email):
+        wants_calendar = wants_email = True
+
+    live = []
+    if wants_calendar:
+        try:
+            cal = get_upcoming_events(max_results=10, days_ahead=7)
+            live.append(f"### Calendar (next 7 days):\n{cal}")
+        except Exception as e:
+            notes.append(f"Calendar read failed ({e}).")
+    if wants_email:
+        try:
+            mail = get_recent_emails(max_results=5)
+            live.append(f"### Recent emails:\n{mail}")
+        except Exception as e:
+            notes.append(f"Gmail read failed ({e}).")
+
+    if not live:
+        return {"ok": True, "text": "I couldn't read anything from Google right now.",
+                "sources": "", "notes": notes}
+
+    facts = worker_facts(user_id, request)
+    user_content = f"Request: {request}\n\n" + "\n\n".join(live)
+    if prior.strip():
+        user_content += f"\n\nNotes from other specialists:\n{prior.strip()}"
+
+    text = llm_chat(
+        "agent_executive",
+        [{"role": "system", "content": SYSTEM_PROMPT[:1200] + "\n\n" + EXECUTIVE_PROMPT + facts_block(facts)},
+         {"role": "user", "content": user_content[:MAX_USER_CHARS + AGENT_PRIOR_CHARS]}],
+        max_tokens=1000,
+    )
+    return {"ok": True, "text": text, "sources": "", "notes": notes}
+
+WORKER_FUNCS = {"researcher": run_researcher, "planner": run_planner, "writer": run_writer, "executive": run_executive}
 
 async def run_delegation(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str, workers: list):
     """The main assistant delegates: workers run one after another, each seeing the earlier ones' notes."""
@@ -2022,7 +1918,6 @@ async def run_delegation(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     user_id = str(update.effective_user.id).strip()
     await update.message.reply_text("On it. Passing this to: " + " then ".join(WORKER_LABELS[w] for w in workers) + ".")
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
     outputs, prior = [], ""
     for worker in workers:
         try:
@@ -2034,7 +1929,6 @@ async def run_delegation(update: Update, context: ContextTypes.DEFAULT_TYPE, use
         outputs.append((worker, result))
         if result["ok"] and result["text"]:
             prior = (prior + f"\n\n[{WORKER_LABELS[worker]} notes]\n{result['text']}")[-AGENT_PRIOR_CHARS:]
-
     good = [(w, r) for w, r in outputs if r["ok"] and r["text"]]
     notes = [n for _, r in outputs for n in r["notes"]]
     if not good:
@@ -2050,12 +1944,10 @@ async def run_delegation(update: Update, context: ContextTypes.DEFAULT_TYPE, use
         parts.append("(Handled by: " + " -> ".join(WORKER_LABELS[w] for w, _ in good) + ")")
         reply = "\n\n".join(parts)
     await send_long(context.bot, chat_id, reply)
-
     history = chat_history.setdefault(user_id, [])
     history.append({"role": "user", "content": user_text[:HISTORY_ITEM_CHARS]})
     history.append({"role": "assistant", "content": reply[:HISTORY_ITEM_CHARS]})
     chat_history[user_id] = history[-HISTORY_MESSAGES * 2:]
-
 
 AGENTS_HELP = (
     "My specialist workers:\n"
@@ -2064,11 +1956,12 @@ AGENTS_HELP = (
     "- Planner: prioritises your saved commitments, deadlines and reminders. "
     "Triggers: \"prioritise...\", \"what's pending\", \"what should I focus on\", \"plan my week\".\n"
     "- Writer: drafts emails, replies, proposals and messages from your saved facts, with [placeholders] instead of guesses. "
-    "Triggers: \"draft/write/compose... an email / reply / proposal / message\".\n\n"
+    "Triggers: \"draft/write/compose... an email / reply / proposal / message\".\n"
+    "- Executive: reads your Google Calendar and Gmail, and can summarize your day. "
+    "Triggers: \"my calendar\", \"what's on today\", \"check my inbox\", \"upcoming meetings\".\n\n"
     "A request can chain workers, for example \"research Acme Textiles and draft an intro email\" goes to the Researcher "
     "and then the Writer. Every reply says who handled it, and /usage shows each worker's token use."
 )
-
 
 async def agents_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -2076,7 +1969,6 @@ async def agents_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     status = "" if ENABLE_AGENTS else "\n\n(Sub-agents are currently turned off: ENABLE_AGENTS=false.)"
     await update.message.reply_text(AGENTS_HELP + status)
-
 
 async def post_init(app):
     # The health server is already up, so Render marks this deploy healthy and stops the old copy meanwhile.
@@ -2090,7 +1982,6 @@ async def post_init(app):
     await asyncio.to_thread(startup_model_check)
     app.bot_data["scheduler_task"] = asyncio.create_task(scheduler_loop(app))
 
-
 async def post_shutdown(app):
     task = app.bot_data.get("scheduler_task")
     if task:
@@ -2102,20 +1993,17 @@ async def post_shutdown(app):
     if usage_state["dirty"]:
         await asyncio.to_thread(save_usage)
 
-
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         await update.message.reply_text("Access restricted.")
         return
     await update.message.reply_text(format_usage())
 
-
 async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         await update.message.reply_text("Access restricted.")
         return
     await update.message.reply_text(format_reminders())
-
 
 async def cancel_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -2130,13 +2018,11 @@ async def cancel_reminder_command(update: Update, context: ContextTypes.DEFAULT_
         change = {"action": "cancel_none"}
     await update.message.reply_text(await apply_reminder_request(change))
 
-
 async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         await update.message.reply_text("Access restricted.")
         return
     await update.message.reply_text(format_schedule())
-
 
 async def briefing_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -2146,7 +2032,6 @@ async def briefing_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id).strip()
     await deliver_report(context.bot, update.effective_chat.id, user_id, "daily")
 
-
 async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         await update.message.reply_text("Access restricted.")
@@ -2154,7 +2039,6 @@ async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     user_id = str(update.effective_user.id).strip()
     await deliver_report(context.bot, update.effective_chat.id, user_id, "weekly")
-
 
 async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List the newest saved memories so you can remove outdated ones with /forget <number>."""
@@ -2170,14 +2054,12 @@ async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not records:
         await update.message.reply_text("No memories saved yet.")
         return
-
     shown = records[:20]
     context.application.bot_data["memory_listing"] = [r["id"] for r in shown]
     lines = [f"{i}. {r['memory'][:150]}" for i, r in enumerate(shown, start=1)]
     header = f"Newest {len(shown)} of {len(records)} memories:\n\n"
     footer = "\n\nRemove one with /forget <number>, for example /forget 3."
     await send_long(context.bot, update.effective_chat.id, header + "\n".join(lines) + footer)
-
 
 async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -2202,7 +2084,6 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Could not delete it: {e}")
 
-
 # ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
@@ -2219,12 +2100,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "You can also say things like \"move my briefing to 8:30 AM\"."
     )
 
-
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         await update.message.reply_text("Access restricted.")
         return
-
     msg = update.message
     if msg.voice:
         media, filename = msg.voice, "voice.ogg"
@@ -2232,24 +2111,20 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         media, filename = msg.audio, (msg.audio.file_name or "audio.mp3")
     else:
         media, filename = msg.document, (msg.document.file_name or "recording.m4a")
-
     if media.file_size and media.file_size > MAX_AUDIO_BYTES:
         await msg.reply_text(
             "That file is over 20 MB, which is the most a Telegram bot can download. "
             "Please trim or compress the recording (for example split it into parts) and send it again."
         )
         return
-
     user_id = str(update.effective_user.id).strip()
     caption = (msg.caption or "").strip()
-
     is_short_voice = (
         bool(msg.voice)
         and VOICE_COMMAND_MAX_SECONDS > 0
         and (msg.voice.duration or 0) <= VOICE_COMMAND_MAX_SECONDS
         and not caption
     )
-
     if is_short_voice:
         # Short voice note -> treat as a spoken message to the assistant
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -2257,30 +2132,24 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             process_voice_command(update, context, media.file_id, filename)
         )
         return
-
     # Long voice note / audio file / call recording -> transcript, summary, action items, memory
     await msg.reply_text("Got it. Transcribing now. Long recordings can take a few minutes.")
     context.application.create_task(
         process_audio(context.bot, update.effective_chat.id, user_id, media.file_id, filename, caption)
     )
 
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         await update.message.reply_text("Access restricted.")
         return
-
     user_text = update.message.text.strip()
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-
     # Schedule changes are handled first; otherwise explicit "search for ..." style requests use the web
     if (parse_reminder_request(user_text) is None and parse_schedule_request(user_text) is None
             and wants_web_search(user_text)):
         await run_search_turn(update, context, user_text[:300])
         return
-
     await process_user_text(update, context, user_text)
-
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -2292,24 +2161,20 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await run_search_turn(update, context, query[:300])
 
-
 async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str,
                             search_context: str = "", search_note: str = "", save_memory: bool = True):
     """Core assistant + memory pipeline, shared by typed messages and short voice notes."""
     user_id = str(update.effective_user.id).strip()
-
     # Reminders ("remind me at 3 PM to call Amit") are handled here, not sent to the AI or saved as a memory
     reminder_change = parse_reminder_request(user_text)
     if reminder_change is not None:
         await update.message.reply_text(await apply_reminder_request(reminder_change))
         return
-
     # "Move my briefing to 8:30 AM" etc. is handled here, not sent to the AI or saved as a memory
     change = parse_schedule_request(user_text)
     if change is not None:
         await update.message.reply_text(await apply_schedule_change(change))
         return
-
     # Specialist workers (research / planning / drafting). Skipped for explicit /search turns.
     if save_memory and not search_context and not search_note:
         workers = plan_delegation(user_text)
@@ -2317,25 +2182,20 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             logger.info(f"[Agents] Delegating to: {', '.join(workers)}")
             await run_delegation(update, context, user_text, workers)
             return
-
     # 1. TWO-TIER RETRIEVAL (run off the event loop so the bot stays responsive)
     all_facts = []
-
     try:
         profile_res = await asyncio.to_thread(memory.get_all, filters={"user_id": user_id})
         all_facts.extend(parse_memories(profile_res))
     except Exception as e:
         logger.warning(f"Profile retrieval: {e}")
-
     try:
         search_res = await asyncio.to_thread(memory.search, user_text, filters={"user_id": user_id})
         all_facts.extend(parse_memories(search_res))
     except Exception as e:
         logger.warning(f"Episodic search: {e}")
-
     unique_memories = list(dict.fromkeys(all_facts))
     retrieved_context = build_memory_context(unique_memories)
-
     # 2. PROMPT AUGMENTATION
     augmented_system = SYSTEM_PROMPT
     if retrieved_context:
@@ -2344,40 +2204,31 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             f"{retrieved_context}\n\n"
             f"Directive: Use the facts above as ground-truth context about your employer."
         )
-
     if search_context:
         augmented_system += search_context
-
     # 3. SLIDING CONVERSATION WINDOW
     if user_id not in chat_history:
         chat_history[user_id] = []
-
     messages_payload = [{"role": "system", "content": augmented_system}]
     messages_payload.extend(chat_history[user_id][-HISTORY_MESSAGES:])
     messages_payload.append({"role": "user", "content": user_text[:MAX_USER_CHARS]})
-
     # 4. INFERENCE VIA GROQ (with rate-limit fallback)
     chat_task = classify_chat_task(user_text, bool(search_context))
     reply_text = await asyncio.to_thread(chat_with_fallback, messages_payload, user_text, chat_task)
-
     chat_history[user_id].append({"role": "user", "content": user_text[:HISTORY_ITEM_CHARS]})
     chat_history[user_id].append({"role": "assistant", "content": reply_text[:HISTORY_ITEM_CHARS]})
     chat_history[user_id] = chat_history[user_id][-HISTORY_MESSAGES * 2:]
-
     # 5. SEND REPLY
     if search_note:
         reply_text = f"{search_note}\n\n{reply_text}"
     await update.message.reply_text(reply_text)
-
     # 6. BACKGROUND MEMORY SAVE (skipped for web-search turns so lookups don't clutter memory)
     if not save_memory:
         return
     known = {m.strip().lower() for m in unique_memories}
-
     def save_memory_task():
         if len(user_text.split()) < 3:
             return
-
         with extraction_lock:
             # --- Step A: extract facts with the tiny prompt (retry on temporary limits)
             facts = None
@@ -2393,16 +2244,13 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     else:
                         logger.error(f"[Memory Engine] Extraction failed: {e}")
                         break
-
             if facts is None:
                 # Extraction unavailable: keep the raw message so nothing is lost
                 facts = [user_text[:500]] if len(user_text.split()) >= 5 else []
-
             facts = [f for f in facts if f.strip().lower() not in known]
             if not facts:
                 logger.info("[Memory Engine] Nothing new to store.")
                 return
-
             # --- Step B: store directly (infer=False -> no mem0 LLM call, no big prompt)
             for fact in facts:
                 for attempt in range(4):
@@ -2416,18 +2264,15 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                         else:
                             logger.error(f"[Memory Engine] Store failed: {e}")
                             break
-
     asyncio.get_running_loop().run_in_executor(None, save_memory_task)
-
 
 # Global Telegram Error Handler to safely catch and log unhandled exceptions
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if type(context.error).__name__ == "Conflict":
+    if type(context.error).name == "Conflict":
         logger.warning("[Telegram] Another copy of the bot is polling (normal for a few seconds during a deploy). "
                        "If this repeats every few seconds, a second instance is running somewhere.")
         return
     logger.error("Exception while handling an update:", exc_info=context.error)
-
 
 # ---------------------------------------------------------------------------
 # Health check server (keeps Render's port binding happy)
@@ -2438,15 +2283,12 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"Bot is healthy and running.")
-
     def log_message(self, format, *args):
         pass
-
 
 def run_health_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
     server.serve_forever()
-
 
 def build_audio_filter():
     """Voice notes, audio files, and call recordings sent as documents (.m4a, .mp3, ...)."""
@@ -2455,15 +2297,12 @@ def build_audio_filter():
         audio_filter = audio_filter | filters.Document.FileExtension(ext)
     return audio_filter
 
-
 def main():
     if not TELEGRAM_BOT_TOKEN or not ALLOWED_USER_ID:
         raise ValueError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_ALLOWED_USER_ID")
-
     http_thread = threading.Thread(target=run_health_server, daemon=True)
     http_thread.start()
     print(f"Health server successfully bound to port {PORT}")
-
     print(f"Starting AI Employee for User ID: {ALLOWED_USER_ID}...")
     app = (
         ApplicationBuilder()
@@ -2472,7 +2311,6 @@ def main():
         .post_shutdown(post_shutdown)
         .build()
     )
-
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("usage", usage_command))
@@ -2487,10 +2325,8 @@ def main():
     app.add_handler(MessageHandler(build_audio_filter(), handle_audio))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_error_handler(error_handler)
-
     print("Bot is live! Listening for Telegram messages...")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
