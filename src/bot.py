@@ -207,6 +207,10 @@ TASK_TIERS = {
     "report_daily": "fast",
     "report_weekly": "strong",
     "summary_combine": "fast",
+    "agent_query_plan": "fast",
+    "agent_researcher": "strong",
+    "agent_planner": "strong",
+    "agent_writer": "strong",
 }
 COMPLEX_HINTS = re.compile(
     r"\b(analy[sz]e|analysis|compare|comparison|strateg\w*|plan|draft|write|rewrite|summari[sz]e|explain|"
@@ -368,6 +372,12 @@ def format_usage() -> str:
         lines.append("")
         lines.append(f"Routing (7 days): {fast['calls'] * 100 // total_calls}% of calls and "
                      f"{(fast['in'] + fast['out']) * 100 // max(total_tokens, 1)}% of tokens went to the fast model.")
+    if week_tasks:
+        lines.append("")
+        lines.append("By task (7 days):")
+        for task, e in sorted(week_tasks.items(), key=lambda kv: -(kv[1]["in"] + kv[1]["out"]))[:10]:
+            noun = "call" if e["calls"] == 1 else "calls"
+            lines.append(f"- {task}: {e['calls']} {noun}, {e['in'] + e['out']:,} tokens")
     extraction = week_tasks.get("extraction")
     if extraction and extraction["calls"]:
         average = extraction["in"] / extraction["calls"]
@@ -1821,6 +1831,253 @@ async def fire_due_reminders(bot, now: datetime):
             logger.error(f"[Reminders] Could not deliver reminder #{item.get('id')}: {e}", exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# SUB-AGENTS: the main assistant hands specialised work to focused workers.
+# A rule-based dispatcher (no extra AI call) picks the workers; each worker has its own prompt,
+# its own tools and its own token budget, and shows up as its own task in /usage.
+# ---------------------------------------------------------------------------
+ENABLE_AGENTS = os.getenv("ENABLE_AGENTS", "true").lower() == "true"
+AGENT_MAX_WORKERS = int(os.getenv("AGENT_MAX_WORKERS", 3))   # a request never spawns more workers than this
+AGENT_PRIOR_CHARS = 4000                                     # how much earlier worker output the next worker sees
+WORKER_LABELS = {"researcher": "Researcher", "planner": "Planner", "writer": "Writer"}
+
+RESEARCH_RE = re.compile(
+    r"\b(research|investigate|look into|find out (?:about|more)|background (?:on|of)|competitors?|"
+    r"market (?:size|trends?|analysis)|due diligence|tell me (?:everything )?about (?:the )?(?:company|business|firm))\b",
+    re.IGNORECASE,
+)
+PLAN_RE = re.compile(
+    r"\b(prioriti[sz]e|what should i (?:do|focus|work)|plan my (?:day|week|morning|afternoon)|"
+    r"what'?s (?:pending|due|open|overdue)|open commitments|my follow[- ]?ups|what do i (?:owe|need to do)|to-?do list)\b",
+    re.IGNORECASE,
+)
+WRITE_RE = re.compile(
+    r"\b(draft|write|compose|prepare|put together)\b[^.?!\n]{0,60}\b(e-?mail|mail|message|reply|response|proposal|"
+    r"follow[- ]?up|letter|whatsapp|text|note|pitch|quotation|quote|announcement|post|caption|report|summary)\b",
+    re.IGNORECASE,
+)
+
+RESEARCHER_PROMPT = (
+    "You are the Researcher, a specialist worker for the user's AI assistant. Answer the request using ONLY the "
+    "numbered web results and the known facts provided. Cite web results as [1], [2]. If the results do not answer "
+    "something, say so plainly; never invent facts, figures or sources. Be concise: key findings first, then what "
+    "they mean for the user if relevant. Plain text, no markdown symbols."
+)
+PLANNER_PROMPT = (
+    "You are the Planner, a specialist worker for the user's AI assistant. Using ONLY the saved items, reminders and "
+    "today's date provided, produce a prioritised plan. Use these headings (skip any with nothing under it): "
+    "'Do today', 'This week', 'Waiting on others or at risk'. Mention due dates. Under 250 words, plain text, no "
+    "markdown symbols. Never invent tasks."
+)
+WRITER_PROMPT = (
+    "You are the Writer, a specialist worker for the user's AI assistant. Draft exactly what was asked, in a "
+    "professional, warm, concise tone. Use the known facts (names, commitments, dates) accurately. Never invent facts, "
+    "prices or dates: where information is missing write a [bracketed placeholder]. If research notes are provided, "
+    "use them. Output the draft first, then a final line starting with 'Assumptions:' listing anything you assumed "
+    "(leave that line out if you assumed nothing). Plain text."
+)
+QUERY_PLAN_PROMPT = (
+    "Turn the request into at most 3 short, distinct web search queries that would help research it. Use only the "
+    "topic itself (a company, product or market). Never include personal details about the user, phone numbers or "
+    "email addresses. Reply with ONLY a JSON array of strings."
+)
+
+
+def plan_delegation(text: str) -> list:
+    """Which workers should handle this message, in order. An empty list means normal chat."""
+    if not ENABLE_AGENTS:
+        return []
+    workers = []
+    if RESEARCH_RE.search(text):
+        workers.append("researcher")
+    if PLAN_RE.search(text):
+        workers.append("planner")
+    if WRITE_RE.search(text):
+        workers.append("writer")
+    return workers[:AGENT_MAX_WORKERS]
+
+
+def worker_facts(user_id: str, text: str) -> list:
+    try:
+        return parse_memories(memory.search(text, filters={"user_id": user_id}))[:MAX_MEMORY_ITEMS]
+    except Exception as e:
+        logger.warning(f"[Agents] Memory lookup failed: {e}")
+        return []
+
+
+def facts_block(facts: list) -> str:
+    if not facts:
+        return ""
+    return "\n\nKnown facts about your employer:\n" + "\n".join(f"- {f[:MAX_MEMORY_ITEM_CHARS]}" for f in facts)
+
+
+def plan_queries(request: str) -> list:
+    try:
+        out = llm_chat("agent_query_plan", [{"role": "system", "content": QUERY_PLAN_PROMPT},
+                                            {"role": "user", "content": request[:600]}], max_tokens=400, temperature=0)
+        match = re.search(r"\[.*\]", out, flags=re.DOTALL)
+        queries = [q.strip()[:200] for q in json.loads(match.group(0)) if isinstance(q, str) and q.strip()][:3]
+        if queries:
+            return queries
+    except Exception as e:
+        logger.warning(f"[Agents] Query planning failed, using the request itself: {e}")
+    return [request[:200]]
+
+
+def numbered_results(results: list) -> str:
+    blocks = []
+    for i, r in enumerate(results, start=1):
+        title = (r.get("title") or "").strip()[:120]
+        content = " ".join((r.get("content") or "").split())[:SEARCH_SNIPPET_CHARS]
+        blocks.append(f"[{i}] {title}\n{content}")
+    return "\n\n".join(blocks)[:SEARCH_TOTAL_CHARS]
+
+
+def sources_block(results: list) -> str:
+    if not results:
+        return ""
+    return "Sources:\n" + "\n".join(
+        f"[{i}] {(r.get('title') or '').strip()[:80]} - {(r.get('url') or '').strip()}" for i, r in enumerate(results, start=1))
+
+
+def run_researcher(user_id: str, request: str, prior: str) -> dict:
+    notes, results, seen = [], [], set()
+    if not TAVILY_API_KEY:
+        notes.append("Web search isn't set up, so I used memory only.")
+    else:
+        for query in plan_queries(request):
+            if not take_search_slot():
+                notes.append("The daily search limit was reached, so some searches were skipped.")
+                break
+            found, error = tavily_search(query)
+            if error:
+                notes.append(f"One search failed ({error}).")
+                continue
+            for r in found:
+                url = (r.get("url") or "").strip()
+                if url and url not in seen:
+                    seen.add(url)
+                    results.append(r)
+        results = results[:6]
+
+    facts = worker_facts(user_id, request)
+    if not results and not facts:
+        return {"ok": True, "text": "I couldn't find anything useful on that. Try adding the company or product name.",
+                "sources": "", "notes": notes}
+
+    user_content = f"Request: {request}\n\n" + (
+        f"Web results:\n{numbered_results(results)}" if results else "No web results are available.")
+    text = llm_chat(
+        "agent_researcher",
+        [{"role": "system", "content": SYSTEM_PROMPT[:1200] + "\n\n" + RESEARCHER_PROMPT + facts_block(facts)},
+         {"role": "user", "content": user_content}],
+        max_tokens=1200,
+    )
+    return {"ok": True, "text": text, "sources": sources_block(results), "notes": notes}
+
+
+def run_planner(user_id: str, request: str, prior: str) -> dict:
+    records = get_memory_records(user_id)
+    items = [r for r in records if has_label(r, ACTION_LABELS)][:30]
+    upcoming = sorted(reminders["items"], key=lambda r: parse_iso(r["due"]))[:15]
+    if not items and not upcoming:
+        return {"ok": True, "sources": "", "notes": [],
+                "text": "I don't have any saved commitments, deadlines or reminders yet, so there is nothing to prioritise. "
+                        "Tell me what is on your plate or send a call recording."}
+
+    now = now_local()
+    content = f"Today is {now.strftime('%A, %d %B %Y')}.\n\nRequest: {request}\n\nSaved items:\n"
+    content += "\n".join(item_line(r) for r in items) if items else "(none)"
+    content += "\n\nReminders:\n"
+    content += "\n".join(f"- {fmt_due(parse_iso(r['due']), now)}: {r['text']}" for r in upcoming) if upcoming else "(none)"
+    text = llm_chat(
+        "agent_planner",
+        [{"role": "system", "content": SYSTEM_PROMPT[:1200] + "\n\n" + PLANNER_PROMPT},
+         {"role": "user", "content": content}],
+        max_tokens=1000,
+    )
+    return {"ok": True, "text": text, "sources": "", "notes": []}
+
+
+def run_writer(user_id: str, request: str, prior: str) -> dict:
+    facts = worker_facts(user_id, request)
+    content = f"Request: {request}"
+    if prior.strip():
+        content += f"\n\nNotes from other specialists:\n{prior.strip()}"
+    text = llm_chat(
+        "agent_writer",
+        [{"role": "system", "content": SYSTEM_PROMPT[:1200] + "\n\n" + WRITER_PROMPT + facts_block(facts)},
+         {"role": "user", "content": content[:MAX_USER_CHARS + AGENT_PRIOR_CHARS]}],
+        max_tokens=900,
+    )
+    return {"ok": True, "text": text, "sources": "", "notes": []}
+
+
+WORKER_FUNCS = {"researcher": run_researcher, "planner": run_planner, "writer": run_writer}
+
+
+async def run_delegation(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str, workers: list):
+    """The main assistant delegates: workers run one after another, each seeing the earlier ones' notes."""
+    chat_id = update.effective_chat.id
+    user_id = str(update.effective_user.id).strip()
+    await update.message.reply_text("On it. Passing this to: " + " then ".join(WORKER_LABELS[w] for w in workers) + ".")
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    outputs, prior = [], ""
+    for worker in workers:
+        try:
+            result = await asyncio.to_thread(WORKER_FUNCS[worker], user_id, user_text, prior)
+        except Exception as e:
+            logger.error(f"[Agents] {worker} failed: {e}", exc_info=True)
+            reason = "a rate limit" if is_rate_limit_error(e) else "an error"
+            result = {"ok": False, "text": "", "sources": "", "notes": [f"The {WORKER_LABELS[worker]} hit {reason}."]}
+        outputs.append((worker, result))
+        if result["ok"] and result["text"]:
+            prior = (prior + f"\n\n[{WORKER_LABELS[worker]} notes]\n{result['text']}")[-AGENT_PRIOR_CHARS:]
+
+    good = [(w, r) for w, r in outputs if r["ok"] and r["text"]]
+    notes = [n for _, r in outputs for n in r["notes"]]
+    if not good:
+        reply = "Sorry, my specialists couldn't finish this" + (f" ({' '.join(notes)})" if notes else "") + \
+                ". Please try again in a minute."
+    else:
+        parts = [good[-1][1]["text"]]
+        sources = next((r["sources"] for w, r in good if w == "researcher" and r["sources"]), "")
+        if sources:
+            parts.append(sources)
+        if notes:
+            parts.append("Notes: " + " ".join(notes))
+        parts.append("(Handled by: " + " -> ".join(WORKER_LABELS[w] for w, _ in good) + ")")
+        reply = "\n\n".join(parts)
+    await send_long(context.bot, chat_id, reply)
+
+    history = chat_history.setdefault(user_id, [])
+    history.append({"role": "user", "content": user_text[:HISTORY_ITEM_CHARS]})
+    history.append({"role": "assistant", "content": reply[:HISTORY_ITEM_CHARS]})
+    chat_history[user_id] = history[-HISTORY_MESSAGES * 2:]
+
+
+AGENTS_HELP = (
+    "My specialist workers:\n"
+    "- Researcher: searches the web with up to 3 focused queries and answers with sources, using what I remember about you. "
+    "Triggers: \"research...\", \"look into...\", \"find out about...\", \"competitors of...\".\n"
+    "- Planner: prioritises your saved commitments, deadlines and reminders. "
+    "Triggers: \"prioritise...\", \"what's pending\", \"what should I focus on\", \"plan my week\".\n"
+    "- Writer: drafts emails, replies, proposals and messages from your saved facts, with [placeholders] instead of guesses. "
+    "Triggers: \"draft/write/compose... an email / reply / proposal / message\".\n\n"
+    "A request can chain workers, for example \"research Acme Textiles and draft an intro email\" goes to the Researcher "
+    "and then the Writer. Every reply says who handled it, and /usage shows each worker's token use."
+)
+
+
+async def agents_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("Access restricted.")
+        return
+    status = "" if ENABLE_AGENTS else "\n\n(Sub-agents are currently turned off: ENABLE_AGENTS=false.)"
+    await update.message.reply_text(AGENTS_HELP + status)
+
+
 async def post_init(app):
     # The health server is already up, so Render marks this deploy healthy and stops the old copy meanwhile.
     # Polling and the scheduler start only after that, so two copies never poll or send reminders together.
@@ -1957,7 +2214,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "AI Personal Employee operational on Render Cloud. How can I assist you today?\n"
         "Send a short voice note and I'll answer it like a message. Send a longer voice note or call recording "
         "and I'll transcribe it, summarise it, and save the action items.\n"
-        "Commands: /search <question>, /reminders, /usage, /briefing, /weekly, /schedule, /memories, /forget <number>.\n"
+        "Commands: /search <question>, /agents, /reminders, /usage, /briefing, /weekly, /schedule, /memories, /forget <number>.\n"
         "Reminders: say \"remind me at 3 PM to call Amit\" or \"remind me tomorrow at 10 AM to send the quote\".\n"
         "You can also say things like \"move my briefing to 8:30 AM\"."
     )
@@ -2052,6 +2309,14 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if change is not None:
         await update.message.reply_text(await apply_schedule_change(change))
         return
+
+    # Specialist workers (research / planning / drafting). Skipped for explicit /search turns.
+    if save_memory and not search_context and not search_note:
+        workers = plan_delegation(user_text)
+        if workers:
+            logger.info(f"[Agents] Delegating to: {', '.join(workers)}")
+            await run_delegation(update, context, user_text, workers)
+            return
 
     # 1. TWO-TIER RETRIEVAL (run off the event loop so the bot stays responsive)
     all_facts = []
@@ -2211,6 +2476,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("usage", usage_command))
+    app.add_handler(CommandHandler("agents", agents_command))
     app.add_handler(CommandHandler("reminders", reminders_command))
     app.add_handler(CommandHandler("cancelreminder", cancel_reminder_command))
     app.add_handler(CommandHandler("schedule", schedule_command))
